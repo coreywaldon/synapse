@@ -1,6 +1,6 @@
 # Synapse
 
-![Maven Central](https://img.shields.io/maven-central/v/com.synapse/core)
+![Maven Central](https://img.shields.io/maven-central/v/com.synapselib/core)
 ![Kotlin](https://img.shields.io/badge/kotlin-1.9.0-blue.svg?logo=kotlin)
 ![License](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
@@ -27,7 +27,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.synapse:core:1.0.0")
+    implementation("com.synapselib:core:1.0.0")
 }
 ```
 
@@ -36,8 +36,8 @@ dependencies {
 You can wrap any existing `Flow` using `.asReactive()` or use the provided extension functions directly.
 
 ```kotlin
-import com.synapse.core.asReactive
-import com.synapse.core.gate
+import com.synapselib.core.asReactive
+import com.synapselib.core.gate
 
 // Example: A robust analytics tracker that buffers when offline
 // and prevents spamming the server.
