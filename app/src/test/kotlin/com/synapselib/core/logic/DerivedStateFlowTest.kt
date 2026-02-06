@@ -1,7 +1,8 @@
-package com.synapse.core.logic
+package com.synapselib.core.logic
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -15,7 +16,7 @@ import org.junit.jupiter.api.Test
 class LogicExtensionsTest {
 
     // Helper to make assertions cleaner
-    private fun assertFlowValue(expected: Boolean, flow: kotlinx.coroutines.flow.StateFlow<Boolean>) {
+    private fun assertFlowValue(expected: Boolean, flow: StateFlow<Boolean>) {
         assertEquals(expected, flow.value, "Synchronous .value check failed")
     }
 

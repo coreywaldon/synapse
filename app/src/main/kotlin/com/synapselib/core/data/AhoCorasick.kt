@@ -1,4 +1,4 @@
-package com.synapse.core.data
+package com.synapselib.core.data
 
 /**
  * Represents a single state (node) in the Aho-Corasick Trie.

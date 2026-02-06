@@ -1,4 +1,4 @@
-package com.synapse.core
+package com.synapselib.core
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -21,6 +21,7 @@ import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.Collections
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.milliseconds
@@ -125,7 +126,7 @@ class ReactiveFlowStressTest {
             repeat(emissionCount) { emit(it) }
         }
 
-        val results = java.util.Collections.synchronizedList(mutableListOf<List<Int>>())
+        val results = Collections.synchronizedList(mutableListOf<List<Int>>())
 
         // Chunk rapidly. The operator must handle internal buffer locking correctly.
         flow.asReactive()
@@ -153,7 +154,7 @@ class ReactiveFlowStressTest {
         val shared = source.asReactive().broadcast(broadcastScope, replays = 0)
 
         val totalReceived = AtomicInteger(0)
-        val persistentResults = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val persistentResults = Collections.synchronizedList(mutableListOf<Int>())
 
         // 2. Latch to signal when the subscriber is fully connected
         val warmUpLatch = CompletableDeferred<Unit>()

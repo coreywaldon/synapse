@@ -1,4 +1,4 @@
-package com.synapse.core.logic
+package com.synapselib.core.logic
 
 import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.flow.*

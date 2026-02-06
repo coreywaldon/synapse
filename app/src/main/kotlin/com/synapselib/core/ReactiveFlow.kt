@@ -1,6 +1,6 @@
-package com.synapse.core
+package com.synapselib.core
 
-import com.synapse.core.data.buildAutomaton
+import com.synapselib.core.data.buildAutomaton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job

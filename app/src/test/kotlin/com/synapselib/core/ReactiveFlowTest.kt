@@ -1,5 +1,6 @@
-package com.synapse.core
+package com.synapselib.core
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
@@ -930,7 +931,7 @@ class ReactiveFlowTest {
         val flow = flow<Unit> {
             attempts++
             // Simulate a coroutine cancellation
-            throw kotlinx.coroutines.CancellationException("Cancelled")
+            throw CancellationException("Cancelled")
         }
 
         val job = launch {
@@ -938,7 +939,7 @@ class ReactiveFlowTest {
                 flow.asReactive()
                     .resilient(maxRetries = 5)
                     .collect {}
-            } catch (_: kotlinx.coroutines.CancellationException) {
+            } catch (_: CancellationException) {
                 // Expected
             }
         }
