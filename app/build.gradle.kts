@@ -1,6 +1,8 @@
+import com.vanniktech.maven.publish.SonatypeHost
+
 plugins {
     id("buildsrc.convention.kotlin-jvm")
-    `maven-publish`
+    id("com.vanniktech.maven.publish") version "0.30.0"
     signing
     application
 }
@@ -22,38 +24,34 @@ application {
     mainClass = "com.synapselib.app.AppKt"
 }
 
-configure<PublishingExtension> {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            from(components["java"])
-            pom {
-                name.set("SynapseLib")
-                description.set("Kotlin library for high-performance synapses.")
-                url.set("https://github.com/coreywaldon/synapse")
-                licenses {
-                    license {
-                        name.set("The Apache License, Version 2.0")
-                        url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
-                    }
-                }
-                developers {
-                    developer {
-                        id.set("coreywaldon")
-                        name.set("Corey Waldon")
-                    }
-                }
-                scm {
-                    connection.set("scm:git:git://github.com/username/repository.git")
-                    url.set("https://github.com/coreywaldon/synapse")
-                }
+mavenPublishing {
+    // Tells the plugin to use the new Central Portal API
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
+
+    // Signs artifacts using GPG_SIGNING_KEY and GPG_PASSWORD env variables automatically
+    signAllPublications()
+
+    coordinates(group.toString(), "synapse-lib", version.toString())
+
+    pom {
+        name.set("SynapseLib")
+        description.set("Kotlin library for high-performance synapses.")
+        url.set("https://github.com/coreywaldon/synapse")
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
             }
         }
+        developers {
+            developer {
+                id.set("coreywaldon")
+                name.set("Corey Waldon")
+            }
+        }
+        scm {
+            connection.set("scm:git:git://github.com/coreywaldon/synapse.git")
+            url.set("https://github.com/coreywaldon/synapse")
+        }
     }
-}
-
-signing {
-    val signingKey = System.getenv("GPG_SIGNING_KEY")
-    val signingPassword = System.getenv("GPG_PASSWORD")
-    useInMemoryPgpKeys(signingKey, signingPassword)
-    sign(publishing.publications["mavenJava"])
 }

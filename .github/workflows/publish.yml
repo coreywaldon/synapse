@@ -20,9 +20,9 @@ jobs:
       - name: Run Tests
         run: ./gradlew test
 
-      - name: Publish to Central
+      - name: Publish to Maven Central
         if: success()
-        run: ./gradlew publishToSonatype
+        run: ./gradlew publishToMavenCentral --no-configuration-cache
         env:
           # These match the variables in your build.gradle.kts
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
