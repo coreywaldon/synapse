@@ -55,3 +55,13 @@ mavenPublishing {
         }
     }
 }
+
+signing {
+    val signingKey = System.getenv("GPG_SIGNING_KEY")
+    val signingPassword = System.getenv("GPG_PASSWORD")
+    useInMemoryPgpKeys(signingKey, signingPassword)
+    if (!signingKey.isNullOrBlank()) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign(publishing.publications)
+    }
+}
