@@ -146,6 +146,22 @@ inputEvents
 
 ---
 
+### `chunk`
+**Bundling signals**
+
+Take an input value, then waits until a duration is up. Combines all values in that period into a list, then emits it.
+
+```kotlin
+// Example: Batching log entries every 5 seconds or when 100 items are reached
+logFlow
+    .chunk(period = 5.seconds, maxBufferSize = 100)
+    .collect { batch ->
+        cloudLogger.sendBatch(batch)
+    }
+```
+
+---
+
 ### `shutter`
 **Trigger-Based Sampling**
 
