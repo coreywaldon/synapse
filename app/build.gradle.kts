@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.synapselib"
-version = "1.0.0"
+version = "1.0.1"
 
 dependencies {
     // Project "app" depends on project "utils". (Project paths are separated with ":", so ":utils" refers to the top-level "utils" project.)
