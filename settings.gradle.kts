@@ -8,6 +8,7 @@ dependencyResolutionManagement {
     @Suppress("UnstableApiUsage")
     repositories {
         mavenCentral()
+        google()
     }
 }
 
@@ -23,3 +24,4 @@ include(":app")
 include(":utils")
 
 rootProject.name = "Synapse"
+include("arch")
