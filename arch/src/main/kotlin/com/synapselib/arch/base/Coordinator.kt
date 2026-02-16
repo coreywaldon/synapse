@@ -1,6 +1,6 @@
 package com.synapselib.arch.base
 
-import com.synapselib.arch.base.routing.RequestParams
+import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
  * @param switchboard the [SwitchBoard] this coordinator communicates through.
  * @param scope       optional externally-managed [CoroutineScope] (e.g.
  *                    `viewModelScope`). If not provided, a new scope with a
- *                    [SupervisorJob] on [Dispatchers.Main.immediate] is created.
+ *                    [SupervisorJob] on [Dispatchers.Main] is created.
  *                    When an external scope is supplied, [CoordinatorScope.dispose]
  *                    will cancel only the jobs it owns; the parent scope's
  *                    lifecycle is unaffected.
@@ -115,7 +115,7 @@ class CoordinatorScope(
      * ```
      *
      * @param T           the data type the interceptor operates on (inferred).
-     * @param point       the [InterceptPoint] (channel + direction) to intercept.
+     * @param point       the [InterceptPoint] (channel and direction) to intercept.
      * @param interceptor the [Interceptor] to install.
      * @param priority    execution priority; lower values run first. Defaults to `0`.
      * @return the [Registration] handle, also stored internally for cleanup.
@@ -206,30 +206,18 @@ class CoordinatorScope(
 
     /**
      * Returns the downstream-intercepted [SharedFlow] for the result of
-     * routing [params] through the [SwitchBoard]'s request pipeline.
+     * routing [impulse] through the [SwitchBoard]'s request pipeline.
      *
-     * Use this overload when you need access to the raw flow:
+     * Use this overload when you need access to the raw flow
      *
-     * ```kotlin
-     * val resultFlow = Request<UserProfile, FetchUserParams>(
-     *     params = FetchUserParams(userId = 42),
-     * )
-     *
-     * launch {
-     *     resultFlow.collectLatest { profile ->
-     *         Broadcast(profile)
-     *     }
-     * }
-     * ```
-     *
-     * @param Need the expected result type.
-     * @param T    the [RequestParams] subtype.
-     * @param params parameters forwarded to the request pipeline.
+     * @param Need     the expected result type from the request handler.
+     * @param I        the [Impulse] subtype describing the request.
+     * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
      * @return a [SharedFlow] with `replay = 1` emitting intercepted results.
      */
-    inline fun <reified Need : Any, reified T : RequestParams> Request(
-        params: T,
-    ): SharedFlow<Need> = switchboard.handleRequest(Need::class, params)
+    inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
+        impulse: DataImpulse<Need>,
+    ): SharedFlow<DataState<Need>> = switchboard.handleRequest(impulse)
 
     // ── Handler Overloads (launch + collect) ────────────────────────────
 
@@ -296,24 +284,18 @@ class CoordinatorScope(
      * so you can chain further broadcasts, triggers, or state updates
      * directly from the result handler.
      *
-     * ```kotlin
-     * Request<UserProfile, FetchUserParams>(FetchUserParams(userId = 42)) { profile ->
-     *     launch { Broadcast(profile) }
-     * }
-     * ```
-     *
      * @param Need     the expected result type from the request handler.
-     * @param T        the [RequestParams] subtype describing the request.
-     * @param params   parameters forwarded to the [SwitchBoard]'s request pipeline.
+     * @param I        the [Impulse] subtype describing the request.
+     * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
      * @param callback invoked with the result, with [CoordinatorScope] as the
      *                 receiver.
      * @return the [Job] backing this request.
      */
-    inline fun <reified Need : Any, reified T : RequestParams> Request(
-        params: T,
-        noinline callback: CoordinatorScope.(Need) -> Unit,
+    inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
+        impulse: DataImpulse<Need>,
+        noinline callback: CoordinatorScope.(DataState<Need>) -> Unit,
     ): Job = launch {
-        switchboard.handleRequest<Need, T>(params).collectLatest { need -> callback(need) }
+        switchboard.handleRequest(impulse).collectLatest { need -> callback(need) }
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────────

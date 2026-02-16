@@ -2,9 +2,16 @@
 
 package com.synapselib.arch.base
 
-import com.synapselib.arch.base.routing.RequestParams
-import com.synapselib.arch.base.routing.Router
+import com.synapselib.arch.base.provider.NoProviderException
+import com.synapselib.arch.base.provider.Provider
+import com.synapselib.arch.base.provider.ProviderRegistry
+import com.synapselib.arch.base.provider.ProviderScope
+import com.synapselib.core.typed.DataState
+import com.synapselib.core.typed.dataOrNull
+import com.synapselib.core.typed.isLoading
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
@@ -12,12 +19,14 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.reflect.KClass
+import kotlin.coroutines.CoroutineContext
 
 class DefaultSwitchBoardTest {
 
@@ -28,35 +37,70 @@ class DefaultSwitchBoardTest {
     data class ToastReaction(val message: String)
     data class AnalyticsReaction(val event: String)
 
-    data class TestRequestParams(val query: String) : RequestParams()
+    // ── Test DataImpulses & Providers ────────────────────────────────────
+
     data class TestResult(val answer: String)
 
-    // ── Fake Router ──────────────────────────────────────────────────────
+    data class FetchResult(val query: String) : DataImpulse<TestResult>()
 
-    @Suppress("UNCHECKED_CAST")
-    private class FakeRouter : Router {
-        val routedParams = CopyOnWriteArrayList<RequestParams>()
-        var resultProvider: (RequestParams) -> Any? = { null }
-        
-        override fun <Need : Any, T : RequestParams> route(
-            needType: KClass<Need>,
-            params: T
-        ): Flow<Need> {
-            routedParams.add(params)
-            return flow {
-                val result = resultProvider(params)
-                if (result != null) {
-                    emit(result as Need)
-                }
+    class FetchResultProvider(
+        private val resultProvider: (String) -> TestResult?,
+    ) : Provider<FetchResult, TestResult>() {
+        override fun ProviderScope.produce(impulse: FetchResult): Flow<TestResult> = flow {
+            val result = resultProvider(impulse.query)
+            if (result != null) emit(result)
+        }
+    }
+
+    data class FailingImpulse(val reason: String) : DataImpulse<TestResult>()
+
+    class FailingProvider : Provider<FailingImpulse, TestResult>() {
+        override fun ProviderScope.produce(impulse: FailingImpulse): Flow<TestResult> = flow {
+            throw RuntimeException(impulse.reason)
+        }
+    }
+
+    data class MultiEmitImpulse(val count: Int) : DataImpulse<TestResult>()
+
+    class MultiEmitProvider : Provider<MultiEmitImpulse, TestResult>() {
+        override fun ProviderScope.produce(impulse: MultiEmitImpulse): Flow<TestResult> = flow {
+            repeat(impulse.count) { i ->
+                emit(TestResult("item_$i"))
             }
         }
     }
 
-    // ── State: broadcast & listen ────────────────────────────────────────
+    data class UnregisteredImpulse(val x: Int) : DataImpulse<TestResult>()
+
+    // ── Helper: build board with no providers ────────────────────────────
+
+    private fun emptyBoard(scope: CoroutineScope) =
+        DefaultSwitchBoard(scope = scope)
+
+    // ── Helper: build board with test providers ──────────────────────────
+
+    private fun boardWithProviders(
+        scope: CoroutineScope,
+        workerContext: CoroutineContext = UnconfinedTestDispatcher(),
+        resultProvider: (String) -> TestResult? = { TestResult("answer for $it") },
+    ): DefaultSwitchBoard {
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> { FetchResultProvider(resultProvider) }
+            .register<TestResult, FailingImpulse> { FailingProvider() }
+            .register<TestResult, MultiEmitImpulse> { MultiEmitProvider() }
+            .build()
+        return DefaultSwitchBoard(scope = scope, providerRegistry = registry, workerContext = workerContext)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // State: broadcast & listen
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `broadcastState emits value that stateFlow receives`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<UserState>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -74,7 +118,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `broadcastState replays latest value to new collectors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.broadcastState(UserState::class, UserState("Bob", 25))
         advanceUntilIdle()
 
@@ -92,7 +138,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `broadcastState delivers multiple values in order`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<UserState>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -111,7 +159,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reified broadcastState and stateFlow work correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<UserState>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -130,7 +180,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `state channels for different types are isolated`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val users = CopyOnWriteArrayList<UserState>()
         val themes = CopyOnWriteArrayList<ThemeState>()
 
@@ -151,11 +203,15 @@ class DefaultSwitchBoardTest {
         job2.cancel()
     }
 
-    // ── Reaction: trigger & listen ───────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Reaction: trigger & listen
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `triggerImpulse emits value that impulseFlow receives`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<ToastReaction>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -173,7 +229,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reaction has no replay - late collectors miss past events`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.triggerImpulse(ToastReaction::class, ToastReaction("missed"))
         advanceUntilIdle()
 
@@ -190,7 +248,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `multiple reactions delivered in order`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<ToastReaction>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -209,7 +269,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reified triggerImpulse and impulseFlow work correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<ToastReaction>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
@@ -228,7 +290,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reaction channels for different types are isolated`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val toasts = CopyOnWriteArrayList<ToastReaction>()
         val analytics = CopyOnWriteArrayList<AnalyticsReaction>()
 
@@ -249,11 +313,15 @@ class DefaultSwitchBoardTest {
         job2.cancel()
     }
 
-    // ── State upstream interceptors ──────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // State upstream interceptors
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `state upstream interceptor transforms data before emission`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -275,7 +343,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `state upstream read interceptor observes without modifying`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val observed = CopyOnWriteArrayList<UserState>()
 
         board.addInterceptor(
@@ -303,7 +373,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `state downstream interceptor transforms data before delivery`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM),
             clazz = UserState::class,
@@ -325,7 +397,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `state upstream and downstream interceptors compose correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -350,11 +424,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Reaction upstream interceptors ────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Reaction upstream interceptors
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `reaction upstream interceptor transforms data before emission`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
             clazz = ToastReaction::class,
@@ -378,7 +456,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reaction downstream interceptor transforms data before delivery`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM),
             clazz = ToastReaction::class,
@@ -400,7 +480,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reaction upstream and downstream interceptors compose correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
             clazz = ToastReaction::class,
@@ -425,11 +507,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Interceptor priority ─────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Interceptor priority
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `interceptors execute in priority order within a given point`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -456,11 +542,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Interceptor unregistration ───────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Interceptor unregistration
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `unregistered interceptor no longer applies`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val reg = board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -489,7 +579,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reified addInterceptor extension works correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             interceptor = Interceptor.transform<UserState> { it.copy(name = "reified!") },
@@ -508,11 +600,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── InterceptPoint isolation ─────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // InterceptPoint isolation
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `interceptors at different points do not interfere`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val upstreamHits = AtomicInteger(0)
         val downstreamHits = AtomicInteger(0)
 
@@ -540,11 +636,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Raw flow access ──────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Raw flow access
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `getRawStateFlow returns a flow that receives broadcast values`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val flow = board.getRawStateFlow(UserState::class)
 
         val received = CopyOnWriteArrayList<Any>()
@@ -563,7 +663,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `getRawStateFlow bypasses downstream interceptors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM),
             clazz = UserState::class,
@@ -587,7 +689,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `getRawStateFlow still receives upstream-intercepted values`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -611,7 +715,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `getRawImpulseFlow returns a flow that receives triggered reactions`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val flow = board.getRawImpulseFlow(ToastReaction::class)
 
         val received = CopyOnWriteArrayList<Any>()
@@ -630,7 +736,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `getRawImpulseFlow bypasses downstream interceptors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM),
             clazz = ToastReaction::class,
@@ -652,66 +760,297 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Request channel ──────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Request path: DataImpulse → Provider → DataState
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    fun `handleRequest routes params through the router`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { params ->
-            TestResult("answer for ${(params as TestRequestParams).query}")
-        }
-        val boardWithRouter = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
+    fun `request returns DataState Success with provider result`() = runTest(UnconfinedTestDispatcher()) {
+        val boardScope = CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob())
+        val board = boardWithProviders(boardScope)
 
-        val received = CopyOnWriteArrayList<TestResult>()
-        val resultFlow = boardWithRouter.handleRequest(
-            needClazz = TestResult::class,
-            params = TestRequestParams("question"),
-        )
+        val stateFlow = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("question"))
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
 
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { received.add(it) }
+            stateFlow.collect { received.add(it) }
         }
         advanceUntilIdle()
 
-        assertEquals(1, fakeRouter.routedParams.size)
-        assertEquals(TestRequestParams("question"), fakeRouter.routedParams.first())
-        assertEquals(TestResult("answer for question"), received.first())
+        val terminal = received.last()
+        assertInstanceOf(DataState.Success::class.java, terminal)
+        assertEquals(TestResult("answer for question"), (terminal as DataState.Success).data)
 
         job.cancel()
     }
 
     @Test
-    fun `request upstream interceptor transforms params before routing`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { TestResult("ok") }
-        val boardWithRouter = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
+    fun `request transitions through Loading before Success`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher(testScheduler)
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = boardWithProviders(boardScope, workerContext = testDispatcher)
 
-        boardWithRouter.addInterceptor(
-            point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
-            clazz = TestRequestParams::class,
-            interceptor = Interceptor.transform { it.copy(query = it.query.uppercase()) },
-        )
+        val stateFlow = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("q"))
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
 
-        val resultFlow = boardWithRouter.handleRequest(
-            needClazz = TestResult::class,
-            params = TestRequestParams("hello"),
-        )
-
-        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { }
+        val job = launch(testDispatcher) {
+            stateFlow.collect { received.add(it) }
         }
         advanceUntilIdle()
 
-        assertEquals("HELLO", (fakeRouter.routedParams.first() as TestRequestParams).query)
+        assertTrue(received.any { it is DataState.Loading }, "Should have received Loading")
+        assertTrue(received.any { it is DataState.Success }, "Should have received Success")
+
+        val loadingIndex = received.indexOfFirst { it is DataState.Loading }
+        val successIndex = received.indexOfFirst { it is DataState.Success }
+        assertTrue(loadingIndex < successIndex, "Loading should precede Success")
 
         job.cancel()
     }
 
-    // ── Multiple listeners ───────────────────────────────────────────────
+    @Test
+    fun `request returns DataState Error when provider throws`() = runTest(UnconfinedTestDispatcher()) {
+        val boardScope = CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob())
+        val board = boardWithProviders(boardScope)
+
+        val stateFlow = board.handleRequest(
+            FailingImpulse::class, TestResult::class, FailingImpulse("boom"),
+        )
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            stateFlow.collect { received.add(it) }
+        }
+        advanceUntilIdle()
+
+        val terminal = received.last()
+        assertInstanceOf(DataState.Error::class.java, terminal)
+        assertEquals("boom", (terminal as DataState.Error).cause.message)
+
+        job.cancel()
+    }
+
+    @Test
+    fun `request with reified extension infers types correctly`() = runTest(UnconfinedTestDispatcher()) {
+        val boardScope = CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob())
+        val board = boardWithProviders(boardScope)
+
+        val stateFlow = board.handleRequest(FetchResult("reified-q"))
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            stateFlow.collect { received.add(it) }
+        }
+        advanceUntilIdle()
+
+        val terminal = received.last()
+        assertInstanceOf(DataState.Success::class.java, terminal)
+        assertEquals(TestResult("answer for reified-q"), (terminal as DataState.Success).data)
+
+        job.cancel()
+    }
+
+    @Test
+    fun `request throws NoProviderException for unregistered impulse`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+
+        assertThrows(NoProviderException::class.java) {
+            board.handleRequest(UnregisteredImpulse::class, TestResult::class, UnregisteredImpulse(1))
+        }
+    }
+
+    @Test
+    fun `request emits nothing when provider flow is empty`() = runTest(UnconfinedTestDispatcher()) {
+        val board = boardWithProviders(backgroundScope, resultProvider = { null })
+
+        val stateFlow = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("empty"))
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            stateFlow.collect { received.add(it) }
+        }
+        advanceUntilIdle()
+
+        // Should have Loading but no Success (provider emitted nothing)
+        assertTrue(received.any { it is DataState.Loading }, "Should have received Loading")
+        assertTrue(received.none { it is DataState.Success }, "Should not have received Success")
+
+        job.cancel()
+    }
+
+    // ── Request: deduplication ───────────────────────────────────────────
+
+    @Test
+    fun `identical impulses share the same DataState flow`() = runTest(UnconfinedTestDispatcher()) {
+        val invocationCount = AtomicInteger(0)
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> {
+                object : Provider<FetchResult, TestResult>() {
+                    override fun ProviderScope.produce(impulse: FetchResult): Flow<TestResult> = flow {
+                        invocationCount.incrementAndGet()
+                        emit(TestResult("result"))
+                        kotlinx.coroutines.awaitCancellation()
+                    }
+                }
+            }
+            .build()
+
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = DefaultSwitchBoard(boardScope, registry, workerContext = testDispatcher)
+
+        val flow1 = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("same"))
+        val flow2 = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("same"))
+
+        val received1 = CopyOnWriteArrayList<DataState<TestResult>>()
+        val received2 = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job1 = launch(UnconfinedTestDispatcher(testScheduler)) {
+            flow1.collect { received1.add(it) }
+        }
+        val job2 = launch(UnconfinedTestDispatcher(testScheduler)) {
+            flow2.collect { received2.add(it) }
+        }
+        advanceUntilIdle()
+
+        // Provider should only have been invoked once (dedup)
+        assertEquals(1, invocationCount.get(), "Provider should be invoked only once for identical impulses")
+
+        // Both flows should have received Success
+        assertTrue(received1.any { it is DataState.Success })
+        assertTrue(received2.any { it is DataState.Success })
+
+        job1.cancel()
+        job2.cancel()
+    }
+
+    @Test
+    fun `different impulse parameters create separate provider jobs`() = runTest(UnconfinedTestDispatcher()) {
+        val invocationCount = AtomicInteger(0)
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> {
+                object : Provider<FetchResult, TestResult>() {
+                    override fun ProviderScope.produce(impulse: FetchResult): Flow<TestResult> = flow {
+                        invocationCount.incrementAndGet()
+                        emit(TestResult("result for ${impulse.query}"))
+                    }
+                }
+            }
+            .build()
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = DefaultSwitchBoard(boardScope, registry, workerContext = testDispatcher)
+
+        val flow1 = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("alpha"))
+        val flow2 = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("beta"))
+
+        val received1 = CopyOnWriteArrayList<DataState<TestResult>>()
+        val received2 = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job1 = launch(UnconfinedTestDispatcher(testScheduler)) {
+            flow1.collect { received1.add(it) }
+        }
+        val job2 = launch(UnconfinedTestDispatcher(testScheduler)) {
+            flow2.collect { received2.add(it) }
+        }
+        advanceUntilIdle()
+
+        assertEquals(2, invocationCount.get(), "Different params should invoke provider twice")
+
+        val success1 = received1.filterIsInstance<DataState.Success<TestResult>>().first()
+        val success2 = received2.filterIsInstance<DataState.Success<TestResult>>().first()
+        assertEquals("result for alpha", success1.data.answer)
+        assertEquals("result for beta", success2.data.answer)
+
+        job1.cancel()
+        job2.cancel()
+    }
+
+    // ── Request: multi-emit provider ────────────────────────────────────
+
+    @Test
+    fun `provider that emits multiple values updates DataState for each`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher(testScheduler)
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, MultiEmitImpulse> {
+                object : Provider<MultiEmitImpulse, TestResult>() {
+                    override fun ProviderScope.produce(impulse: MultiEmitImpulse): Flow<TestResult> = flow {
+                        repeat(impulse.count) { i ->
+                            emit(TestResult("item_$i"))
+                        }
+                    }
+                }
+            }
+            .build()
+        val board = DefaultSwitchBoard(boardScope, registry, workerContext = testDispatcher)
+
+        val stateFlow = board.handleRequest(
+            MultiEmitImpulse::class, TestResult::class, MultiEmitImpulse(3),
+        )
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job = launch(testDispatcher) {
+            stateFlow.collect { received.add(it) }
+        }
+        advanceUntilIdle()
+
+        val successes = received.filterIsInstance<DataState.Success<TestResult>>()
+        assertEquals(3, successes.size)
+        assertEquals(listOf("item_0", "item_1", "item_2"), successes.map { it.data.answer })
+
+        job.cancel()
+    }
+
+    // ── Request: error with stale data ──────────────────────────────────
+
+    @Test
+    fun `DataState Error carries stale data from last success`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher(testScheduler)
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val callCount = AtomicInteger(0)
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> {
+                object : Provider<FetchResult, TestResult>() {
+                    override fun ProviderScope.produce(impulse: FetchResult): Flow<TestResult> = flow {
+                        val count = callCount.incrementAndGet()
+                        if (count == 1) {
+                            emit(TestResult("good"))
+                            throw RuntimeException("fail after first emit")
+                        }
+                    }
+                }
+            }
+            .build()
+        val board = DefaultSwitchBoard(scope = boardScope, providerRegistry = registry, workerContext = testDispatcher)
+
+        val stateFlow = board.handleRequest(FetchResult::class, TestResult::class, FetchResult("q"))
+        val received = CopyOnWriteArrayList<DataState<TestResult>>()
+
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            stateFlow.collect { received.add(it) }
+        }
+        advanceUntilIdle()
+
+        val error = received.filterIsInstance<DataState.Error<TestResult>>().first()
+        assertEquals("fail after first emit", error.cause.message)
+        assertEquals(TestResult("good"), error.staleData)
+
+        job.cancel()
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Multiple listeners
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `multiple collectors on same state channel all receive broadcasts`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+
         val received1 = CopyOnWriteArrayList<UserState>()
         val received2 = CopyOnWriteArrayList<UserState>()
 
@@ -736,7 +1075,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `multiple collectors on same reaction channel all receive events`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received1 = CopyOnWriteArrayList<ToastReaction>()
         val received2 = CopyOnWriteArrayList<ToastReaction>()
 
@@ -757,11 +1098,15 @@ class DefaultSwitchBoardTest {
         job2.cancel()
     }
 
-    // ── Cancellation ─────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Cancellation
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `cancelling collector job stops receiving state updates`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<UserState>()
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
             board.stateFlow(UserState::class).collect { received.add(it) }
@@ -781,7 +1126,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `cancelling collector job stops receiving reactions`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<ToastReaction>()
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
             board.impulseFlow(ToastReaction::class).collect { received.add(it) }
@@ -799,11 +1146,15 @@ class DefaultSwitchBoardTest {
         assertEquals(1, received.size, "Should not receive after cancellation")
     }
 
-    // ── No interceptors registered (passthrough) ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // No interceptors registered (passthrough)
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `state works without any interceptors registered`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<UserState>()
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
             board.stateFlow(UserState::class).collect { received.add(it) }
@@ -820,7 +1171,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `reaction works without any interceptors registered`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val received = CopyOnWriteArrayList<ToastReaction>()
         val job = launch(UnconfinedTestDispatcher(testScheduler)) {
             board.impulseFlow(ToastReaction::class).collect { received.add(it) }
@@ -835,11 +1188,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Full interceptor (short-circuit) ─────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Full interceptor (short-circuit)
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `full interceptor can short-circuit state upstream`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -861,7 +1218,9 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── InterceptPoint data class ────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // InterceptPoint data class
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `InterceptPoint equality and hashCode work correctly`() {
@@ -883,76 +1242,15 @@ class DefaultSwitchBoardTest {
         assertEquals(6, points.size)
     }
 
-    // ── Request downstream interceptor ──────────────────────────────────
-
-    @Test
-    fun `request downstream interceptor transforms result before delivery`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { TestResult("raw") }
-        val board = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
-
-        board.addInterceptor(
-            point = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM),
-            clazz = TestResult::class,
-            interceptor = Interceptor.transform { it.copy(answer = it.answer.uppercase()) },
-        )
-
-        val received = CopyOnWriteArrayList<TestResult>()
-        val resultFlow = board.handleRequest(
-            needClazz = TestResult::class,
-            params = TestRequestParams("q"),
-        )
-
-        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { received.add(it) }
-        }
-        advanceUntilIdle()
-
-        assertEquals(TestResult("RAW"), received.first())
-
-        job.cancel()
-    }
-
-    @Test
-    fun `request upstream and downstream interceptors compose correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { params ->
-            TestResult("echo:${(params as TestRequestParams).query}")
-        }
-        val board = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
-
-        board.addInterceptor(
-            point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
-            clazz = TestRequestParams::class,
-            interceptor = Interceptor.transform { it.copy(query = it.query.uppercase()) },
-        )
-        board.addInterceptor(
-            point = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM),
-            clazz = TestResult::class,
-            interceptor = Interceptor.transform { it.copy(answer = "${it.answer}!") },
-        )
-
-        val received = CopyOnWriteArrayList<TestResult>()
-        val resultFlow = board.handleRequest(
-            needClazz = TestResult::class,
-            params = TestRequestParams("hello"),
-        )
-
-        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { received.add(it) }
-        }
-        advanceUntilIdle()
-
-        assertEquals(TestResult("echo:HELLO!"), received.first())
-
-        job.cancel()
-    }
-
-    // ── Multiple interceptors on same point (chaining) ──────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Multiple interceptors on same point (chaining)
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `multiple upstream interceptors chain in priority order for state`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
@@ -986,11 +1284,11 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Multiple downstream interceptors chaining ───────────────────────
-
     @Test
     fun `multiple downstream interceptors chain in priority order for state`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM),
@@ -1019,11 +1317,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Full interceptor ignoring proceed ───────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Full interceptor variants
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `full interceptor can replace value ignoring original for reactions`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
             clazz = ToastReaction::class,
@@ -1047,7 +1349,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `full interceptor can delegate to proceed`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -1070,11 +1374,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Interceptor type isolation ──────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Interceptor type isolation
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `interceptor for one type does not affect another type on same channel`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -1098,7 +1406,9 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `unregistering one interceptor leaves others intact`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         val reg1 = board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
@@ -1131,34 +1441,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Reified handleRequest ───────────────────────────────────────────
-
-    @Test
-    fun `reified handleRequest extension works correctly`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { TestResult("reified-answer") }
-        val board = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
-
-        val received = CopyOnWriteArrayList<TestResult>()
-        val resultFlow = board.handleRequest<TestResult, TestRequestParams>(
-            params = TestRequestParams("reified-q"),
-        )
-
-        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { received.add(it) }
-        }
-        advanceUntilIdle()
-
-        assertEquals(TestResult("reified-answer"), received.first())
-
-        job.cancel()
-    }
-
-    // ── State replay after downstream interceptor change ────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // State replay
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `stateFlow replays latest value including upstream interception to new collectors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
             clazz = UserState::class,
@@ -1179,11 +1470,11 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Rapid broadcast overwrites (state replay = 1) ───────────────────
-
     @Test
     fun `getRawStateFlow replays latest value to late collectors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         board.broadcastState(UserState::class, UserState("first"))
         board.broadcastState(UserState::class, UserState("second"))
@@ -1201,11 +1492,11 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── getRawImpulseFlow has no replay ─────────────────────────────────
-
     @Test
     fun `getRawImpulseFlow has no replay for late collectors`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         board.triggerImpulse(ToastReaction::class, ToastReaction("missed"))
         advanceUntilIdle()
@@ -1221,11 +1512,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Read interceptor does not modify data ───────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Read interceptor does not modify data
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `reaction upstream read interceptor observes without modifying`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val observed = CopyOnWriteArrayList<ToastReaction>()
 
         board.addInterceptor(
@@ -1249,11 +1544,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Same type on different channels ─────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Same type on different channels
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `same type used on state and reaction channels are independent`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         val stateReceived = CopyOnWriteArrayList<UserState>()
         val reactionReceived = CopyOnWriteArrayList<UserState>()
 
@@ -1280,36 +1579,15 @@ class DefaultSwitchBoardTest {
         job2.cancel()
     }
 
-    // ── handleRequest without router result ─────────────────────────────
-
-    @Test
-    fun `handleRequest emits nothing when router returns no result`() = runTest(UnconfinedTestDispatcher()) {
-        val fakeRouter = FakeRouter()
-        fakeRouter.resultProvider = { null }
-        val board = DefaultSwitchBoard(router = fakeRouter, scope = backgroundScope)
-
-        val received = CopyOnWriteArrayList<TestResult>()
-        val resultFlow = board.handleRequest(
-            needClazz = TestResult::class,
-            params = TestRequestParams("empty"),
-        )
-
-        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
-            resultFlow.collect { received.add(it) }
-        }
-        advanceUntilIdle()
-
-        assertTrue(received.isEmpty())
-        assertEquals(1, fakeRouter.routedParams.size)
-
-        job.cancel()
-    }
-
-    // ── Downstream interceptor on reaction does not affect state ────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Downstream interceptor cross-channel isolation
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `downstream interceptor on reaction channel does not affect state channel`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM),
             clazz = UserState::class,
@@ -1329,11 +1607,15 @@ class DefaultSwitchBoardTest {
         job.cancel()
     }
 
-    // ── Default priority (all zero) preserves insertion order ───────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Default priority preserves insertion order
+    // ══════════════════════════════════════════════════════════════════════
 
     @Test
     fun `interceptors with same priority execute in registration order`() = runTest(UnconfinedTestDispatcher()) {
-        val board = DefaultSwitchBoard(scope = backgroundScope, router = FakeRouter())
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
 
         board.addInterceptor(
             point = InterceptPoint(Channel.STATE, Direction.UPSTREAM),
@@ -1357,5 +1639,98 @@ class DefaultSwitchBoardTest {
         assertEquals("x_1_2", received.first().name)
 
         job.cancel()
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ProviderRegistry: builder validation
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `ProviderRegistry Builder rejects duplicate impulse types`() {
+        assertThrows(IllegalStateException::class.java) {
+            ProviderRegistry.Builder()
+                .register<TestResult, FetchResult> { FetchResultProvider { TestResult("a") } }
+                .register<TestResult, FetchResult> { FetchResultProvider { TestResult("b") } }
+                .build()
+        }
+    }
+
+    @Test
+    fun `ProviderRegistry EMPTY has no providers`() {
+        assertEquals(0, ProviderRegistry.EMPTY.size)
+        assertTrue(ProviderRegistry.EMPTY.registeredImpulseTypes().isEmpty())
+    }
+
+    @Test
+    fun `ProviderRegistry hasProvider reports correctly`() {
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> { FetchResultProvider { TestResult("ok") } }
+            .build()
+
+        assertTrue(registry.hasProvider(FetchResult::class))
+        assertTrue(!registry.hasProvider(UnregisteredImpulse::class))
+    }
+
+    @Test
+    fun `ProviderRegistry Builder mergeFrom combines registries`() {
+        val registryA = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> { FetchResultProvider { TestResult("a") } }
+            .build()
+
+        val registryB = ProviderRegistry.Builder()
+            .register<TestResult, FailingImpulse> { FailingProvider() }
+            .build()
+
+        val merged = ProviderRegistry.Builder()
+            .mergeFrom(registryA)
+            .mergeFrom(registryB)
+            .build()
+
+        assertEquals(2, merged.size)
+        assertTrue(merged.hasProvider(FetchResult::class))
+        assertTrue(merged.hasProvider(FailingImpulse::class))
+    }
+
+    @Test
+    fun `ProviderRegistry Builder mergeFrom rejects duplicates`() {
+        val registryA = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> { FetchResultProvider { TestResult("a") } }
+            .build()
+
+        val registryB = ProviderRegistry.Builder()
+            .register<TestResult, FetchResult> { FetchResultProvider { TestResult("b") } }
+            .build()
+
+        assertThrows(IllegalStateException::class.java) {
+            ProviderRegistry.Builder()
+                .mergeFrom(registryA)
+                .mergeFrom(registryB)
+                .build()
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DataState utility extensions
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `dataOrNull returns data on Success and null otherwise`() {
+        val success: DataState<String> = DataState.Success("hello")
+        val loading: DataState<String> = DataState.Loading
+        val idle: DataState<String> = DataState.Idle
+        val error: DataState<String> = DataState.Error(RuntimeException("fail"))
+
+        assertEquals("hello", success.dataOrNull)
+        assertEquals(null, loading.dataOrNull)
+        assertEquals(null, idle.dataOrNull)
+        assertEquals(null, error.dataOrNull)
+    }
+
+    @Test
+    fun `isLoading returns true only for Loading`() {
+        assertTrue(DataState.Loading.isLoading)
+        assertTrue(!DataState.Idle.isLoading)
+        assertTrue(!DataState.Success("x").isLoading)
+        assertTrue(!DataState.Error<String>(RuntimeException()).isLoading)
     }
 }

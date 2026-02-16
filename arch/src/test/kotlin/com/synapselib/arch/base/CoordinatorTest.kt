@@ -1,18 +1,24 @@
 package com.synapselib.arch.base
 
+import com.synapselib.arch.base.provider.Provider
+import com.synapselib.arch.base.provider.ProviderRegistry
+import com.synapselib.arch.base.provider.ProviderScope
+import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -25,15 +31,18 @@ class CoordinatorScopeTest {
 
     private val testDispatcher = UnconfinedTestDispatcher()
     private val testScope = TestScope(testDispatcher)
-    private lateinit var fakeRouter: FakeRouter
     private lateinit var switchBoard: DefaultSwitchBoard
     private lateinit var coordinatorScope: CoordinatorScope
 
     @BeforeEach
     fun setup() {
-        Dispatchers.setMain(testDispatcher)
-        fakeRouter = FakeRouter()
-        switchBoard = DefaultSwitchBoard(router = fakeRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        switchBoard = DefaultSwitchBoard(
+            scope = boardScope,
+            providerRegistry = testProviderRegistry(),
+            workerContext = testDispatcher
+        )
         coordinatorScope = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + Job()))
     }
 
@@ -54,7 +63,9 @@ class CoordinatorScopeTest {
         assertEquals(switchBoard, scope.switchboard)
     }
 
-    // ── Broadcast / stateFlow ───────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Broadcast / stateFlow
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `broadcast is received by listener`() = testScope.runTest {
@@ -129,7 +140,9 @@ class CoordinatorScopeTest {
         assertEquals(expected, r3)
     }
 
-    // ── Trigger / impulseFlow ───────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Trigger / impulseFlow
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `triggered impulse is received by listener`() = testScope.runTest {
@@ -229,81 +242,102 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestImpulse("before")), received)
     }
 
-    // ── handleRequest ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Request path (DataImpulse → Provider → DataState)
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
-    fun `request delivers router response via flow`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            TestResult(data = "result-for-${(params as TestRequestParams).id}")
-        }
-
-        val result = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 7),
-        ).first()
-
-        assertEquals(TestResult(data = "result-for-7"), result)
-    }
-
-    @Test
-    fun `request passes correct params to router`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("ok") }
-
-        switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 1),
-        ).first()
-        switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 2),
-        ).first()
-
-        assertEquals(
-            listOf(TestRequestParams(id = 1), TestRequestParams(id = 2)),
-            fakeRouter.routedRequests,
+    fun `request delivers DataState Success via flow`() = testScope.runTest {
+        val stateFlow = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 7),
         )
+        val received = mutableListOf<DataState<TestResult>>()
+
+        val job = launch { stateFlow.collect { received.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job.cancel()
+
+        val terminal = received.last()
+        assertTrue(terminal is DataState.Success)
+        assertEquals(TestResult("result-for-7"), (terminal as DataState.Success).data)
     }
 
     @Test
-    fun `request with different param types routes independently`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            when (params) {
-                is TestRequestParams -> TestResult("id=${params.id}")
-                is OtherRequestParams -> TestResult("query=${params.query}")
-                else -> TestResult("unknown")
+    fun `request passes correct params to provider`() = testScope.runTest {
+        val receivedIds = mutableListOf<Int>()
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchTestResult> {
+                object : Provider<FetchTestResult, TestResult>() {
+                    override fun ProviderScope.produce(impulse: FetchTestResult): Flow<TestResult> = flow {
+                        receivedIds.add(impulse.id)
+                        emit(TestResult("ok"))
+                    }
+                }
             }
+            .build()
+        val board = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = registry,
+        )
+
+        val job1 = launch {
+            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(1)).collect {}
         }
+        testScheduler.advanceUntilIdle()
+        job1.cancel()
 
-        val result1 = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 5),
-        ).first()
+        val job2 = launch {
+            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(2)).collect {}
+        }
+        testScheduler.advanceUntilIdle()
+        job2.cancel()
 
-        val result2 = switchBoard.handleRequest(
-            TestResult::class,
-            OtherRequestParams(query = "hello"),
-        ).first()
+        assertEquals(listOf(1, 2), receivedIds)
+    }
 
-        assertEquals(TestResult("id=5"), result1)
-        assertEquals(TestResult("query=hello"), result2)
+    @Test
+    fun `request with different impulse types routes independently`() = testScope.runTest {
+        val flow1 = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 5),
+        )
+        val flow2 = switchBoard.handleRequest(
+            FetchByQuery::class, TestResult::class, FetchByQuery(query = "hello"),
+        )
+
+        val received1 = mutableListOf<DataState<TestResult>>()
+        val received2 = mutableListOf<DataState<TestResult>>()
+
+        val job1 = launch { flow1.collect { received1.add(it) } }
+        val job2 = launch { flow2.collect { received2.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job1.cancel(); job2.cancel()
+
+        val success1 = received1.last() as DataState.Success
+        val success2 = received2.last() as DataState.Success
+        assertEquals(TestResult("result-for-5"), success1.data)
+        assertEquals(TestResult("query=hello"), success2.data)
     }
 
     @Test
     fun `multiple concurrent requests all deliver results`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            TestResult("done-${(params as TestRequestParams).id}")
-        }
+        val results = mutableListOf<TestResult>()
 
-        val results = (1..10).map { id ->
-            switchBoard.handleRequest(
-                TestResult::class,
-                TestRequestParams(id = id),
-            ).first()
+        val jobs = (1..10).map { id ->
+            launch {
+                val flow = switchBoard.handleRequest(
+                    FetchTestResult::class, TestResult::class, FetchTestResult(id),
+                )
+                flow.collect { state ->
+                    if (state is DataState.Success) results.add(state.data)
+                }
+            }
         }
+        testScheduler.advanceUntilIdle()
+        jobs.forEach { it.cancel() }
 
         assertEquals(10, results.size)
         (1..10).forEach { id ->
-            assertEquals(TestResult("done-$id"), results[id - 1])
+            assertTrue(results.contains(TestResult("result-for-$id")))
         }
     }
 
@@ -334,13 +368,17 @@ class CoordinatorScopeTest {
     }
 
     @Test
-    fun `Request flow returns handleRequest flow`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("flow-result") }
+    fun `Request flow returns DataState flow`() = testScope.runTest {
+        val stateFlow = coordinatorScope.Request(FetchTestResult(id = 1))
+        val received = mutableListOf<DataState<TestResult>>()
 
-        val flow = coordinatorScope.Request<TestResult, TestRequestParams>(TestRequestParams(id = 1))
-        val result = flow.first()
+        val job = launch { stateFlow.collect { received.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job.cancel()
 
-        assertEquals(TestResult("flow-result"), result)
+        val terminal = received.last()
+        assertTrue(terminal is DataState.Success)
+        assertEquals(TestResult("result-for-1"), (terminal as DataState.Success).data)
     }
 
     // ── Handler overloads (ListenFor, ReactTo, Request with callback) ──
@@ -375,18 +413,19 @@ class CoordinatorScopeTest {
     }
 
     @Test
-    fun `Request handler receives result`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("handler-result") }
+    fun `Request handler receives DataState transitions`() = testScope.runTest {
+        val received = mutableListOf<DataState<TestResult>>()
 
-        val received = mutableListOf<TestResult>()
-        val job = coordinatorScope.Request<TestResult, TestRequestParams>(
-            TestRequestParams(id = 1)
-        ) { received.add(it) }
-
+        val job = coordinatorScope.Request(FetchTestResult(id = 1)) { state ->
+            received.add(state)
+        }
         testScheduler.advanceUntilIdle()
         job.cancel()
 
-        assertEquals(listOf(TestResult("handler-result")), received)
+        assertTrue(received.any { it is DataState.Loading }, "Should have received Loading")
+        assertTrue(received.any { it is DataState.Success }, "Should have received Success")
+        val success = received.filterIsInstance<DataState.Success<TestResult>>().first()
+        assertEquals(TestResult("result-for-1"), success.data)
     }
 
     @Test
@@ -404,7 +443,24 @@ class CoordinatorScopeTest {
         assertEquals(switchBoard, capturedSwitchboard)
     }
 
-    // ── dispose ─────────────────────────────────────────────────────
+    @Test
+    fun `Request handler has CoordinatorScope as receiver`() = testScope.runTest {
+        var capturedSwitchboard: SwitchBoard? = null
+
+        val job = coordinatorScope.Request(FetchTestResult(id = 1)) { state ->
+            if (state is DataState.Success) {
+                capturedSwitchboard = this.switchboard
+            }
+        }
+        testScheduler.advanceUntilIdle()
+        job.cancel()
+
+        assertEquals(switchBoard, capturedSwitchboard)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // dispose
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `dispose unregisters all interceptors`() = runTest {
@@ -504,7 +560,9 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestImpulse("after-dispose")), externalReceived)
     }
 
-    // ── Broadcast edge cases ────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Broadcast edge cases
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `broadcast same value twice delivers both`() = testScope.runTest {
@@ -555,7 +613,9 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestBroadcast("three")), received)
     }
 
-    // ── Trigger edge cases ──────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Trigger edge cases
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `trigger with no listeners does not throw`() = testScope.runTest {
@@ -580,38 +640,46 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestImpulse("caught")), received)
     }
 
-    // ── handleRequest edge cases ────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Request edge cases
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
-    fun `request flow emits correctly typed result`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult(data = "typed") }
+    fun `request flow emits correctly typed DataState`() = testScope.runTest {
+        val stateFlow = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 1),
+        )
+        val received = mutableListOf<DataState<TestResult>>()
 
-        val result = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 1),
-        ).first()
-
-        assertEquals("typed", result.data)
-    }
-
-    @Test
-    fun `request flow emits exactly one result for one-shot`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("once") }
-
-        val results = mutableListOf<TestResult>()
-        val job = launch {
-            switchBoard.handleRequest(
-                TestResult::class,
-                TestRequestParams(id = 1),
-            ).collect { results.add(it) }
-        }
+        val job = launch { stateFlow.collect { received.add(it) } }
         testScheduler.advanceUntilIdle()
         job.cancel()
 
-        assertEquals(1, results.size)
+        val success = received.filterIsInstance<DataState.Success<TestResult>>().first()
+        assertEquals("result-for-1", success.data.data)
     }
 
-    // ── dispose edge cases ──────────────────────────────────────────────
+    @Test
+    fun `request emits Loading then Success for one-shot provider`() = testScope.runTest {
+        val stateFlow = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 1),
+        )
+        val received = mutableListOf<DataState<TestResult>>()
+
+        val job = launch { stateFlow.collect { received.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job.cancel()
+
+        assertTrue(received.any { it is DataState.Loading })
+        assertTrue(received.any { it is DataState.Success })
+        val loadIdx = received.indexOfFirst { it is DataState.Loading }
+        val successIdx = received.indexOfFirst { it is DataState.Success }
+        assertTrue(loadIdx < successIdx)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // dispose edge cases
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `dispose mid-stream stops interceptor from affecting subsequent applies`() = runTest {
@@ -653,7 +721,9 @@ class CoordinatorScopeTest {
         assertEquals(1, counter2.get())
     }
 
-    // ── Two CoordinatorScopes communicating via switchboard ─────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Two CoordinatorScopes communicating via switchboard
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `one coordinator broadcasts state that another listens to`() = testScope.runTest {
@@ -684,7 +754,9 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestImpulse("ping")), received)
     }
 
-    // ── Broadcast under pressure ────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Broadcast under pressure
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `flood broadcasts are all delivered to listener`() = testScope.runTest {
@@ -739,7 +811,9 @@ class CoordinatorScopeTest {
         assertEquals(50, received.count { it.value.startsWith("b-") })
     }
 
-    // ── Impulse under pressure ──────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Impulse under pressure
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `flood triggers are all delivered in order`() = testScope.runTest {
@@ -778,10 +852,12 @@ class CoordinatorScopeTest {
         assertEquals(100, received.size)
     }
 
-    // ── Lifecycle: dispose during active operations ─────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Lifecycle: dispose during active operations
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
-    fun `dispose while listener is active stops delivery`() = testScope.runTest {
+    fun `dispose while listener is active stops delivery`() = runTest {
         val registry = InterceptorRegistry()
         val values = mutableListOf<String>()
 
@@ -815,7 +891,9 @@ class CoordinatorScopeTest {
         assertTrue(received.contains(TestBroadcast("post-dispose")))
     }
 
-    // ── Chained reactions ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Chained reactions
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `broadcast triggers listener that triggers impulse`() = testScope.runTest {
@@ -857,7 +935,9 @@ class CoordinatorScopeTest {
         assertEquals(listOf(OtherBroadcast(5)), finalValues)
     }
 
-    // ── Interceptor stress ──────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Interceptor stress
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `many interceptors all fire on single apply`() = runTest {
@@ -910,12 +990,13 @@ class CoordinatorScopeTest {
         assertEquals(50, foreignCounter.get())
     }
 
-    // ── Multiple switchboards are isolated ──────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Multiple switchboards are isolated
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `two switchboards do not leak broadcasts`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
         val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
 
         val fromFirst = mutableListOf<TestBroadcast>()
@@ -939,8 +1020,7 @@ class CoordinatorScopeTest {
 
     @Test
     fun `two switchboards do not leak impulses`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
         val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
 
         val fromFirst = mutableListOf<TestImpulse>()
@@ -963,30 +1043,39 @@ class CoordinatorScopeTest {
     }
 
     @Test
-    fun `two switchboards route requests independently`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+    fun `two switchboards request providers independently`() = testScope.runTest {
+        val otherSwitchBoard = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = testProviderRegistry(
+                fetchResult = { TestResult("from-second-$it") },
+            ),
+        )
 
-        fakeRouter.onRoute { TestResult("from-first") }
-        otherRouter.onRoute { TestResult("from-second") }
+        val received1 = mutableListOf<DataState<TestResult>>()
+        val received2 = mutableListOf<DataState<TestResult>>()
 
-        val r1 = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 1),
-        ).first()
+        val job1 = launch {
+            switchBoard.handleRequest(
+                FetchTestResult::class, TestResult::class, FetchTestResult(1),
+            ).collect { received1.add(it) }
+        }
+        val job2 = launch {
+            otherSwitchBoard.handleRequest(
+                FetchTestResult::class, TestResult::class, FetchTestResult(2),
+            ).collect { received2.add(it) }
+        }
+        testScheduler.advanceUntilIdle()
+        job1.cancel(); job2.cancel()
 
-        val r2 = otherSwitchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 2),
-        ).first()
-
-        assertEquals(TestResult("from-first"), r1)
-        assertEquals(TestResult("from-second"), r2)
-        assertEquals(listOf(TestRequestParams(id = 1)), fakeRouter.routedRequests)
-        assertEquals(listOf(TestRequestParams(id = 2)), otherRouter.routedRequests)
+        val success1 = received1.last() as DataState.Success
+        val success2 = received2.last() as DataState.Success
+        assertEquals(TestResult("result-for-1"), success1.data)
+        assertEquals(TestResult("from-second-2"), success2.data)
     }
 
-    // ── Generic type erasure ────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Generic type erasure
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `broadcasts with generic types collide due to type erasure`() = testScope.runTest {
@@ -1016,7 +1105,9 @@ class CoordinatorScopeTest {
         assertEquals(listOf(NodeScopeTest.BoxedBroadcast(42)), receivedInts)
     }
 
-    // ── Cross-communication: Coordinator ↔ Node ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Cross-communication: Coordinator ↔ Node
+    // ══════════════════════════════════════════════════════════════════
 
     @Test
     fun `node trigger is received by coordinator listener`() = testScope.runTest {

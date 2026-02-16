@@ -1,23 +1,25 @@
 package com.synapselib.arch.base
 
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
-import com.synapselib.arch.base.routing.RequestParams
-import com.synapselib.arch.base.routing.Router
+import com.synapselib.arch.base.provider.Provider
+import com.synapselib.arch.base.provider.ProviderRegistry
+import com.synapselib.arch.base.provider.ProviderScope
+import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotSame
@@ -27,7 +29,8 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.reflect.KClass
+
+// ── Shared Test Infrastructure ──────────────────────────────────────────
 
 class SimpleMutableState<T>(initial: T) : MutableState<T> {
     override var value: T = initial
@@ -40,28 +43,38 @@ data class TestImpulse(val message: String) : Impulse()
 data class AnotherImpulse(val code: Int) : Impulse()
 data class TestBroadcast(val value: String)
 data class OtherBroadcast(val number: Int)
-data class TestRequestParams(val id: Int) : RequestParams()
-data class OtherRequestParams(val query: String) : RequestParams()
+
+// ── Shared DataImpulses & Providers ─────────────────────────────────────
+
 data class TestResult(val data: String)
 
-@Suppress("UNCHECKED_CAST")
-class FakeRouter : Router {
-    val routedRequests = mutableListOf<RequestParams>()
-    private var responseProvider: ((RequestParams) -> Any?)? = null
+data class FetchTestResult(val id: Int) : DataImpulse<TestResult>()
+data class FetchByQuery(val query: String) : DataImpulse<TestResult>()
 
-    fun <Need> onRoute(provider: (RequestParams) -> Need) {
-        responseProvider = provider as (RequestParams) -> Any?
-    }
-
-    override fun <Need : Any, T : RequestParams> route(
-        needType: KClass<Need>,
-        params: T
-    ): Flow<Need> {
-        routedRequests.add(params)
-        val result = responseProvider?.invoke(params) as? Need
-        return if (result != null) flowOf(result) else flowOf()
+class FetchTestResultProvider(
+    private val resultProvider: (Int) -> TestResult = { TestResult("result-for-$it") },
+) : Provider<FetchTestResult, TestResult>() {
+    override fun ProviderScope.produce(impulse: FetchTestResult): Flow<TestResult> = flow {
+        emit(resultProvider(impulse.id))
     }
 }
+
+class FetchByQueryProvider(
+    private val resultProvider: (String) -> TestResult = { TestResult("query=$it") },
+) : Provider<FetchByQuery, TestResult>() {
+    override fun ProviderScope.produce(impulse: FetchByQuery): Flow<TestResult> = flow {
+        emit(resultProvider(impulse.query))
+    }
+}
+
+/** Creates a [ProviderRegistry] with the standard test providers. */
+fun testProviderRegistry(
+    fetchResult: (Int) -> TestResult = { TestResult("result-for-$it") },
+    fetchByQuery: (String) -> TestResult = { TestResult("query=$it") },
+): ProviderRegistry = ProviderRegistry.Builder()
+    .register<TestResult, FetchTestResult> { FetchTestResultProvider(fetchResult) }
+    .register<TestResult, FetchByQuery> { FetchByQueryProvider(fetchByQuery) }
+    .build()
 
 // ── ContextScope Tests ──────────────────────────────────────────────────
 
@@ -73,7 +86,7 @@ class ContextScopeTest {
 
     @Test
     fun `exposes context and switchboard`() {
-        val sb = DefaultSwitchBoard(router = FakeRouter(), scope = testScope)
+        val sb = DefaultSwitchBoard(scope = testScope)
         val scope = ContextScope("ctx", sb)
         assertEquals("ctx", scope.context)
         assertSame(sb, scope.switchboard)
@@ -84,7 +97,7 @@ class ContextScopeTest {
         assertNull(
             ContextScope<String?>(
                 null,
-                DefaultSwitchBoard(router = FakeRouter(), scope = testScope),
+                DefaultSwitchBoard(scope = testScope),
             ).context
         )
     }
@@ -97,16 +110,19 @@ class NodeScopeTest {
 
     private val testDispatcher = UnconfinedTestDispatcher()
     private val testScope = TestScope(testDispatcher)
-    private lateinit var fakeRouter: FakeRouter
     private lateinit var switchBoard: DefaultSwitchBoard
     private lateinit var stateHolder: SimpleMutableState<TestState>
     private lateinit var nodeScope: NodeScope<String, TestState>
 
     @BeforeEach
     fun setup() {
-        Dispatchers.setMain(testDispatcher)
-        fakeRouter = FakeRouter()
-        switchBoard = DefaultSwitchBoard(router = fakeRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        switchBoard = DefaultSwitchBoard(
+            scope = boardScope,
+            providerRegistry = testProviderRegistry(),
+            workerContext = testDispatcher
+        )
         stateHolder = SimpleMutableState(TestState())
         val contextScope = ContextScope("testContext", switchBoard)
         nodeScope = NodeScope(contextScope, stateHolder, testScope)
@@ -386,100 +402,119 @@ class NodeScopeTest {
         nodeScope.Trigger(TestImpulse("nobody listening"))
     }
 
-    // ── handleRequest ───────────────────────────────────────────────
+    // ── Request (DataState lifecycle) ────────────────────────────────
 
     @Test
-    fun `request delivers correctly typed router response`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            TestResult(data = "result-for-${(params as TestRequestParams).id}")
-        }
-
-        val result = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 7),
-        ).first()
-
-        assertEquals(TestResult(data = "result-for-7"), result)
-        assertEquals("result-for-7", result.data)
-    }
-
-    @Test
-    fun `request passes correct params to router`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("ok") }
-
-        switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 1),
-        ).first()
-        switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 2),
-        ).first()
-
-        assertEquals(
-            listOf(TestRequestParams(id = 1), TestRequestParams(id = 2)),
-            fakeRouter.routedRequests,
+    fun `request delivers DataState Success via switchboard`() = testScope.runTest {
+        val stateFlow = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 7),
         )
+        val received = mutableListOf<DataState<TestResult>>()
+
+        val job = launch { stateFlow.collect { received.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job.cancel()
+
+        val terminal = received.last()
+        assertTrue(terminal is DataState.Success)
+        assertEquals(TestResult("result-for-7"), (terminal as DataState.Success).data)
     }
 
     @Test
-    fun `request with different param types routes independently`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            when (params) {
-                is TestRequestParams -> TestResult("id=${params.id}")
-                is OtherRequestParams -> TestResult("query=${params.query}")
-                else -> TestResult("unknown")
+    fun `request passes correct params to provider`() = testScope.runTest {
+        val receivedIds = mutableListOf<Int>()
+        val registry = ProviderRegistry.Builder()
+            .register<TestResult, FetchTestResult> {
+                object : Provider<FetchTestResult, TestResult>() {
+                    override fun ProviderScope.produce(impulse: FetchTestResult): Flow<TestResult> = flow {
+                        receivedIds.add(impulse.id)
+                        emit(TestResult("ok"))
+                    }
+                }
             }
+            .build()
+        val board = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = registry,
+        )
+
+        val job1 = launch {
+            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(1)).collect {}
         }
+        testScheduler.advanceUntilIdle()
+        job1.cancel()
 
-        val result1 = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 5),
-        ).first()
+        val job2 = launch {
+            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(2)).collect {}
+        }
+        testScheduler.advanceUntilIdle()
+        job2.cancel()
 
-        val result2 = switchBoard.handleRequest(
-            TestResult::class,
-            OtherRequestParams(query = "hello"),
-        ).first()
+        assertEquals(listOf(1, 2), receivedIds)
+    }
 
-        assertEquals(TestResult("id=5"), result1)
-        assertEquals(TestResult("query=hello"), result2)
+    @Test
+    fun `request with different impulse types routes independently`() = testScope.runTest {
+        val flow1 = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(id = 5),
+        )
+        val flow2 = switchBoard.handleRequest(
+            FetchByQuery::class, TestResult::class, FetchByQuery(query = "hello"),
+        )
+
+        val received1 = mutableListOf<DataState<TestResult>>()
+        val received2 = mutableListOf<DataState<TestResult>>()
+
+        val job1 = launch { flow1.collect { received1.add(it) } }
+        val job2 = launch { flow2.collect { received2.add(it) } }
+        testScheduler.advanceUntilIdle()
+        job1.cancel(); job2.cancel()
+
+        val success1 = received1.last() as DataState.Success
+        val success2 = received2.last() as DataState.Success
+        assertEquals(TestResult("result-for-5"), success1.data)
+        assertEquals(TestResult("query=hello"), success2.data)
     }
 
     @Test
     fun `multiple concurrent requests all deliver results`() = testScope.runTest {
-        fakeRouter.onRoute { params ->
-            TestResult("done-${(params as TestRequestParams).id}")
-        }
+        val results = mutableListOf<TestResult>()
 
-        val results = (1..10).map { id ->
-            switchBoard.handleRequest(
-                TestResult::class,
-                TestRequestParams(id = id),
-            ).first()
+        val jobs = (1..10).map { id ->
+            launch {
+                val flow = switchBoard.handleRequest(
+                    FetchTestResult::class, TestResult::class, FetchTestResult(id),
+                )
+                flow.collect { state ->
+                    if (state is DataState.Success) results.add(state.data)
+                }
+            }
         }
+        testScheduler.advanceUntilIdle()
+        jobs.forEach { it.cancel() }
 
         assertEquals(10, results.size)
         (1..10).forEach { id ->
-            assertEquals(TestResult("done-$id"), results[id - 1])
+            assertTrue(results.contains(TestResult("result-for-$id")))
         }
     }
 
     @Test
-    fun `request flow emits exactly one result for one-shot`() = testScope.runTest {
-        fakeRouter.onRoute { TestResult("once") }
+    fun `request emits Loading then Success for one-shot provider`() = testScope.runTest {
+        val states = mutableListOf<DataState<TestResult>>()
+        val flow = switchBoard.handleRequest(
+            FetchTestResult::class, TestResult::class, FetchTestResult(1),
+        )
 
-        val results = mutableListOf<TestResult>()
-        val job = launch {
-            switchBoard.handleRequest(
-                TestResult::class,
-                TestRequestParams(id = 1),
-            ).collect { results.add(it) }
-        }
+        val job = launch { flow.collect { states.add(it) } }
         testScheduler.advanceUntilIdle()
         job.cancel()
 
-        assertEquals(1, results.size)
+        assertTrue(states.any { it is DataState.Loading })
+        assertTrue(states.any { it is DataState.Success })
+        val loadIdx = states.indexOfFirst { it is DataState.Loading }
+        val successIdx = states.indexOfFirst { it is DataState.Success }
+        assertTrue(loadIdx < successIdx)
     }
 
     // ── dispose ─────────────────────────────────────────────────────
@@ -820,8 +855,7 @@ class NodeScopeTest {
 
     @Test
     fun `two switchboards do not leak broadcasts`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
         val otherScope = NodeScope(
             ContextScope("isolated", otherSwitchBoard),
             SimpleMutableState(TestState()),
@@ -849,8 +883,7 @@ class NodeScopeTest {
 
     @Test
     fun `two switchboards do not leak impulses`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
         val otherScope = NodeScope(
             ContextScope("isolated", otherSwitchBoard),
             SimpleMutableState(TestState()),
@@ -877,27 +910,34 @@ class NodeScopeTest {
     }
 
     @Test
-    fun `two switchboards route requests independently`() = testScope.runTest {
-        val otherRouter = FakeRouter()
-        val otherSwitchBoard = DefaultSwitchBoard(router = otherRouter, scope = CoroutineScope(testDispatcher + Job()))
+    fun `two switchboards request providers independently`() = testScope.runTest {
+        val otherSwitchBoard = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = testProviderRegistry(
+                fetchResult = { TestResult("from-second-$it") },
+            ),
+        )
 
-        fakeRouter.onRoute { TestResult("from-first") }
-        otherRouter.onRoute { TestResult("from-second") }
+        val received1 = mutableListOf<DataState<TestResult>>()
+        val received2 = mutableListOf<DataState<TestResult>>()
 
-        val r1 = switchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 1),
-        ).first()
+        val job1 = launch {
+            switchBoard.handleRequest(
+                FetchTestResult::class, TestResult::class, FetchTestResult(1),
+            ).collect { received1.add(it) }
+        }
+        val job2 = launch {
+            otherSwitchBoard.handleRequest(
+                FetchTestResult::class, TestResult::class, FetchTestResult(2),
+            ).collect { received2.add(it) }
+        }
+        testScheduler.advanceUntilIdle()
+        job1.cancel(); job2.cancel()
 
-        val r2 = otherSwitchBoard.handleRequest(
-            TestResult::class,
-            TestRequestParams(id = 2),
-        ).first()
-
-        assertEquals(TestResult("from-first"), r1)
-        assertEquals(TestResult("from-second"), r2)
-        assertEquals(listOf(TestRequestParams(id = 1)), fakeRouter.routedRequests)
-        assertEquals(listOf(TestRequestParams(id = 2)), otherRouter.routedRequests)
+        val success1 = received1.last() as DataState.Success
+        val success2 = received2.last() as DataState.Success
+        assertEquals(TestResult("result-for-1"), success1.data)
+        assertEquals(TestResult("from-second-2"), success2.data)
     }
 
     // ── Type erasure edge case ──────────────────────────────────────────

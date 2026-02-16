@@ -8,7 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
-import com.synapselib.arch.base.routing.RequestParams
+import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
@@ -84,14 +84,55 @@ inline fun <T> CreateContext(
  *
  * @param T           the type of the context value.
  * @property context     the domain object shared across all [Node]s in this
- *                       context boundary (e.g. a ViewModel).
+ *                       context boundary (e.g., a ViewModel).
  * @property switchboard the [SwitchBoard] used for all cross-node communication
  *                       (state broadcasts, reactions, requests, interception).
  */
 class ContextScope<T>(
     val context: T,
     val switchboard: SwitchBoard,
-)
+) {
+    /**
+     * Triggers a fire-and-forget [Impulse] on the [SwitchBoard]'s reaction channel.
+     *
+     * This is a **suspending, non-composable** function:
+     *
+     * ```kotlin
+     * Button(onClick = { scope.launch { Trigger(ShowToast("Saved!")) } }) {
+     *     Text("Save")
+     * }
+     * ```
+     *
+     * Upstream reaction interceptors are applied before emission.
+     *
+     * @param A     the [Impulse] subtype (inferred).
+     * @param event the impulse event to emit.
+     */
+    suspend inline fun <reified A : Impulse> Trigger(event: A) {
+        switchboard.triggerImpulse(event)
+    }
+
+    /**
+     * Broadcasts [data] into the [SwitchBoard]'s state channel.
+     *
+     * This is a **suspending, non-composable** function. Call it from a
+     * coroutine (e.g., inside `LaunchedEffect` or `scope.launch`):
+     *
+     * ```kotlin
+     * LaunchedEffect(Unit) {
+     *     Broadcast(UserProfile(name = "Alice"))
+     * }
+     * ```
+     *
+     * Upstream state interceptors are applied before emission.
+     *
+     * @param O    the state type (inferred).
+     * @param data the value to broadcast.
+     */
+    suspend inline fun <reified O : Any> Broadcast(data: O) {
+        switchboard.broadcastState(data)
+    }
+}
 
 /**
  * Composable that creates a **stateful node** inside a [ContextScope].
@@ -133,8 +174,8 @@ class ContextScope<T>(
  *
  * @param C            the context type from the enclosing [ContextScope].
  * @param S            the local state type; must be a non-nullable [Any] subtype.
- * @param initialState the starting value for local state. Only used on first
- *                     composition — subsequent recompositions retain the
+ * @param initialState the starting value for the local state. Only used on the first
+ *                     composition — later recompositions retain the
  *                     existing state.
  * @param block        composable content that runs inside the [NodeScope].
  */
@@ -142,7 +183,7 @@ class ContextScope<T>(
 inline fun <C, reified S : Any> ContextScope<C>.Node(
     initialState: S,
     crossinline block: @Composable NodeScope<C, S>.() -> Unit,
-) {
+) : NodeScope<C, S> {
     val stateHolder = remember { mutableStateOf(initialState) }
     val coroutineScope = rememberCoroutineScope { Dispatchers.Main.immediate }
     val nodeScope = remember(this, coroutineScope) {
@@ -154,6 +195,8 @@ inline fun <C, reified S : Any> ContextScope<C>.Node(
     }
 
     nodeScope.block()
+
+    return nodeScope
 }
 
 /**
@@ -191,9 +234,9 @@ inline fun <C, reified S : Any> ContextScope<C>.Node(
  *                   value changes.
  */
 class NodeScope<C, S : Any>(
-    private val contextScope: ContextScope<C>,
-    private val stateHolder: MutableState<S>,
-    @PublishedApi internal val scope: CoroutineScope,
+    val contextScope: ContextScope<C>,
+    val stateHolder: MutableState<S>,
+    val scope: CoroutineScope,
 ) {
     val context: C get() = contextScope.context
     val state: S get() = stateHolder.value
@@ -257,7 +300,7 @@ class NodeScope<C, S : Any>(
      * ```
      *
      * @param T           the data type the interceptor operates on.
-     * @param point       the [InterceptPoint] (channel + direction) to intercept.
+     * @param point       the [InterceptPoint] (channel and direction) to intercept.
      * @param interceptor the [Interceptor] to install.
      * @param priority    execution priority; lower values run first. Defaults to `0`.
      */
@@ -277,7 +320,7 @@ class NodeScope<C, S : Any>(
      * Broadcasts [data] into the [SwitchBoard]'s state channel.
      *
      * This is a **suspending, non-composable** function. Call it from a
-     * coroutine (e.g. inside `LaunchedEffect` or `scope.launch`):
+     * coroutine (e.g., inside `LaunchedEffect` or `scope.launch`):
      *
      * ```kotlin
      * LaunchedEffect(Unit) {
@@ -291,7 +334,7 @@ class NodeScope<C, S : Any>(
      * @param data the value to broadcast.
      */
     suspend inline fun <reified O : Any> Broadcast(data: O) {
-        switchboard.broadcastState(data)
+        contextScope.Broadcast(data)
     }
 
     /**
@@ -311,7 +354,7 @@ class NodeScope<C, S : Any>(
      * @param event the impulse event to emit.
      */
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        switchboard.triggerImpulse(event)
+        contextScope.Trigger(event)
     }
 
     // ── Side Effects (lifecycle-aware, @Composable) ─────────────────────
@@ -332,27 +375,26 @@ class NodeScope<C, S : Any>(
      * ```
      *
      * @param Need     the expected result type from the request handler.
-     * @param T        the [RequestParams] subtype describing the request.
-     * @param params   parameters forwarded to the [SwitchBoard]'s request pipeline.
-     * @param key      recomposition key; defaults to [params]. When the key
-     *                 changes the in-flight request is canceled and a new one
+     * @param I        the [DataImpulse] subtype describing the request.
+     * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
+     * @param key      recomposition key; defaults to [impulse]. When the key
+     *                 changes, the in-flight request is canceled and a new one
      *                 is launched.
      * @param callback invoked on the main dispatcher with each emitted result.
      *                 Wrapped with [rememberUpdatedState] so the latest lambda
      *                 is always called, even if the enclosing scope recomposes.
      */
     @Composable
-    inline fun <reified Need : Any, reified T : RequestParams> Request(
-        params: T,
-        key: Any? = params,
-        noinline callback: (Need) -> Unit,
+    inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
+        impulse: I,
+        key: Any? = impulse,
+        noinline callback: (DataState<Need>) -> Unit,
     ) {
         val currentCallback by rememberUpdatedState(callback)
         DisposableEffect(this, key) {
+            val stateFlow = switchboard.handleRequest(I::class, Need::class, impulse)
             val job = scope.launch {
-                switchboard.handleRequest<Need, T>(params).collectLatest { need ->
-                    currentCallback(need)
-                }
+                stateFlow.collect { currentCallback(it) }
             }
             onDispose { job.cancel() }
         }

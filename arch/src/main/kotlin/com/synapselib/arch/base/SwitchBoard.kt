@@ -1,29 +1,33 @@
 package com.synapselib.arch.base
 
 import androidx.compose.runtime.compositionLocalOf
-import com.synapselib.arch.base.routing.RequestParams
-import com.synapselib.arch.base.routing.Router
+import com.synapselib.arch.base.addInterceptor
+import com.synapselib.arch.base.provider.ProviderManager
+import com.synapselib.arch.base.provider.ProviderRegistry
+import com.synapselib.core.typed.DataState
 import com.synapselib.core.typed.TypedSharedFlow
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
+import javax.inject.Qualifier
+import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import kotlin.time.Duration.Companion.seconds
 
 /**
  * The direction of data flow relative to the [SwitchBoard].
  *
- * - [UPSTREAM]: data is flowing **into** the board (e.g. a broadcast or trigger
+ * - [UPSTREAM]: data is flowing **into** the board (e.g., a broadcast or trigger
  *   before it reaches the underlying flow/router).
- * - [DOWNSTREAM]: data is flowing **out of** the board (e.g. a value being
+ * - [DOWNSTREAM]: data is flowing **out of** the board (e.g., a value being
  *   delivered to a listener or routed to a handler).
  */
 enum class Direction { UPSTREAM, DOWNSTREAM }
@@ -31,8 +35,8 @@ enum class Direction { UPSTREAM, DOWNSTREAM }
 /**
  * Identifies the communication channel that data travels through.
  *
- * - [REQUEST]: one-shot request/response interactions routed via a [Router].
- * - [STATE]: persistent, replay-1 state streams (latest value is always cached).
+ * - [REQUEST]: one-shot request/response interactions routed via the [ProviderManager].
+ * - [STATE]: persistent, replay-1 state streams (the latest value is always cached).
  * - [REACTION]: fire-and-forget event streams with no replay.
  */
 enum class Channel { REQUEST, STATE, REACTION }
@@ -88,7 +92,7 @@ data class InterceptPoint(val channel: Channel, val direction: Direction)
  * ) { profile, theme -> ... }
  * ```
  *
- * Raw (un-intercepted) flows are available via [getRawStateFlow] and
+ * Raw (unintercepted) flows are available via [getRawStateFlow] and
  * [getRawImpulseFlow] for advanced use cases.
  *
  * ## Interception
@@ -139,25 +143,26 @@ interface SwitchBoard {
      * Routes a request through the interceptor pipeline and returns a
      * [SharedFlow] of results with `replay = 1`.
      *
-     * 1. **Upstream interceptors** (`REQUEST / UPSTREAM`) are applied to [params].
-     * 2. The (possibly transformed) params are forwarded to the [Router].
+     * 1. **Upstream interceptors** (`REQUEST / UPSTREAM`) are applied to the [impulse].
+     * 2. The (possibly transformed) params are forwarded to the [com.synapselib.arch.base.provider.ProviderManager].
      * 3. **Downstream interceptors** (`REQUEST / DOWNSTREAM`) are applied to
      *    each result before it is emitted into the shared flow.
      *
      * The flow starts lazily on the first subscriber; after that, the result
      * is cached via replay for late collectors.
      *
-     * @param Need      the type of the result expected by the caller.
-     * @param T         the concrete [RequestParams] subtype.
-     * @param needClazz the [KClass] token for [Need], used for type-safe
-     *                  downstream interception.
-     * @param params    the request parameters describing what to do.
+     * @param Need        the type of the result expected by the caller.
+     * @param I           the concrete [DataImpulse] subtype.
+     * @param impulseType the [KClass] token for [DataImpulse]
+     * @param needType    the [KClass] token for [Need], used for type-safe
+     *                    downstream interception.
      * @return a [SharedFlow] that emits the intercepted result(s).
      */
-    fun <Need : Any, T : RequestParams> handleRequest(
-        needClazz: KClass<Need>,
-        params: T,
-    ): SharedFlow<Need>
+    fun <Need : Any, I : DataImpulse<Need>> handleRequest(
+        impulseType: KClass<I>,
+        needType: KClass<Need>,
+        impulse: I,
+    ): SharedFlow<DataState<Need>>
 
     // ── Consume (Downstream-intercepted) ────────────────────────────────
 
@@ -192,7 +197,7 @@ interface SwitchBoard {
      * Returns the read-only [SharedFlow] backing the state channel for [clazz],
      * **without** downstream interception applied.
      *
-     * Useful for advanced composition (e.g. combining multiple state flows)
+     * Useful for advanced composition (e.g., combining multiple state flows)
      * where the caller will manage interception themselves.
      *
      * @param clazz the [KClass] token identifying the state stream.
@@ -242,9 +247,9 @@ suspend inline fun <reified T : Any> SwitchBoard.triggerImpulse(data: T) =
     triggerImpulse(T::class, data)
 
 /** Reified convenience overload for [SwitchBoard.handleRequest]. */
-inline fun <reified Need : Any, reified T : RequestParams> SwitchBoard.handleRequest(
-    params: T,
-): SharedFlow<Need> = handleRequest(Need::class, params)
+inline fun <reified Need : Any, reified I : DataImpulse<Need>> SwitchBoard.handleRequest(
+    impulse: I,
+): SharedFlow<DataState<Need>> = handleRequest(I::class, Need::class, impulse)
 
 /** Reified convenience overload for [SwitchBoard.addInterceptor]. */
 inline fun <reified T : Any> SwitchBoard.addInterceptor(
@@ -253,33 +258,56 @@ inline fun <reified T : Any> SwitchBoard.addInterceptor(
     priority: Int = 0,
 ): Registration = addInterceptor(point, T::class, interceptor, priority)
 
+/**
+ * Adds logging interceptors for all combinations of [Channel] and [Direction].
+ * The provided logging function [log] is invoked for each data instance of type [T]
+ * as it passes through the specified intercept points in the system.
+ *
+ * @param T The data type for which the logging interceptors are applied.
+ * @param log A function that performs logging or side effects for each observed data instance of type [T].
+ */
+inline fun <reified T: Any> SwitchBoard.addLoggingInterceptors(crossinline log: (T) -> Unit) {
+    for (channel in Channel.entries) {
+        for (direction in Direction.entries) {
+            addInterceptor(
+                point       = InterceptPoint(channel, direction),
+                interceptor = Interceptor.read<T> { data -> log.invoke(data) },
+                priority    = if (direction == Direction.UPSTREAM) Int.MIN_VALUE else Int.MAX_VALUE,
+            )
+        }
+    }
+}
+
+@Qualifier
 annotation class SwitchBoardStopTimeout
+@Qualifier
 annotation class SwitchBoardReplayExpiration
+@Qualifier
+annotation class SwitchBoardScope
+@Qualifier
+annotation class SwitchBoardWorkerContext
 
 // ── Implementation ──────────────────────────────────────────────────────
 
 /**
  * Default [SwitchBoard] implementation backed by Kotlin [SharedFlow]s and
- * a [Router] for request dispatch.
+ * a [com.synapselib.arch.base.provider.ProviderManager] for request dispatch.
  *
  * ## Internal Architecture
  *
  * ```
- *                     ┌──────────────────────────┐
- *                     │      SwitchBoardImpl     │
- *                     │                          │
- *  broadcastState ──▶ │  upstream interceptors   │
- *                     │         ↓                │
- *                     │   MutableSharedFlow      │
- *                     │         ↓                │
- *  listenToState  ◀── │  downstream interceptors │
- *                     │                          │
- *  handleRequest ───▶ │  upstream interceptors   │
- *                     │         ↓                │
- *                     │       Router             │
- *                     │         ↓                │
- *                     │  downstream interceptors │ ──▶ Flow<Need>
- *                     └──────────────────────────┘
+ *                     ┌──────────────────────────────────┐
+ *                     │       DefaultSwitchBoard         │
+ *                     │                                  │
+ *  broadcastState ──▶ │  upstream interceptors → Flow    │ ──▶ stateFlow (downstream intercepted)
+ *  triggerImpulse ──▶ │  upstream interceptors → Flow    │ ──▶ impulseFlow (downstream intercepted)
+ *                     │                                  │
+ *  request ─────────▶ │  ProviderManager                 │
+ *                     │    ├─ dedup by impulse equality  │
+ *                     │    ├─ factory → Provider instance│
+ *                     │    ├─ ProviderScope (SB access)  │
+ *                     │    └─ DataState lifecycle        │ ──▶ SharedFlow<DataState<T>>
+ *                     └──────────────────────────────────┘
  * ```
  *
  * - **State channels**: `MutableSharedFlow(replay = 1)` — the latest value is
@@ -293,16 +321,17 @@ annotation class SwitchBoardReplayExpiration
  *
  * All internal maps are [ConcurrentHashMap]s and all flows are thread-safe.
  * Interceptor registration and pipeline execution may happen concurrently.
- *
- * @param router the [Router] used to dispatch request-channel commands.
- *               Defaults to a fresh [Router] instance.
  */
 class DefaultSwitchBoard @Inject constructor(
-    private val router: Router,
-    private val scope: CoroutineScope,
-    @property:SwitchBoardStopTimeout val stopTimeoutMillis: Long = 3.seconds.inWholeMilliseconds,
-    @property:SwitchBoardReplayExpiration val replayExpirationMillis: Long = 3.seconds.inWholeMilliseconds
+    @param:SwitchBoardScope private val scope: CoroutineScope,
+    providerRegistry: ProviderRegistry,
+    @SwitchBoardWorkerContext workerContext: CoroutineContext = Dispatchers.IO,
+    @param:SwitchBoardStopTimeout private val stopTimeoutMillis: Long = 3.seconds.inWholeMilliseconds,
+    @param:SwitchBoardReplayExpiration private val replayExpirationMillis: Long = 3.seconds.inWholeMilliseconds
 ) : SwitchBoard {
+
+    /** Provider lifecycle manager — handles cold-start, dedup, concurrency. */
+    private val providerManager = ProviderManager(providerRegistry, scope, workerContext)
 
     /** Per-type state flows. Each flow has `replay = 1` so collectors get the latest value. */
     private val stateChannels = ConcurrentHashMap<KClass<*>, MutableSharedFlow<Any>>()
@@ -357,24 +386,11 @@ class DefaultSwitchBoard @Inject constructor(
         mutableReactionFlow(clazz).emit(processed)
     }
 
-    override fun <Need : Any, T : RequestParams> handleRequest(
-        needClazz: KClass<Need>,
-        params: T,
-    ): SharedFlow<Need> {
-        val upstream = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM)
-        val downstream = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM)
-
-        return flow {
-            val processedParams = pipelineFor(upstream)
-                .applyInterceptors(params::class, params)
-
-            router.route(needClazz, processedParams).collect { value ->
-                val processed = pipelineFor(downstream)
-                    .applyInterceptors(needClazz, value)
-                emit(processed)
-            }
-        }.shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis), replay = 1)
-    }
+    override fun <Need : Any, I : DataImpulse<Need>> handleRequest(
+        impulseType: KClass<I>,
+        needType: KClass<Need>,
+        impulse: I,
+    ): SharedFlow<DataState<Need>> = providerManager.request(impulseType, needType, impulse, switchboard = this)
 
     // ── Consume (Downstream-intercepted) ────────────────────────────────
 

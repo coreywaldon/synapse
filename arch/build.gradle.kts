@@ -9,8 +9,8 @@ group = "com.synapselib"
 version = "1.0.1"
 
 dependencies {
-    implementation(project(":app"))
-    testImplementation(project(":app"))
+    implementation(project(":core"))
+    testImplementation(project(":core"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 
     // AndroidX Compose
