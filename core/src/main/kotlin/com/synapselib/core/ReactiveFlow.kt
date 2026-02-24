@@ -131,6 +131,7 @@ class ReactiveFlow<T>(
                                 while (buffer.isNotEmpty()) send(buffer.removeFirst())
                             }
                             send(event.value)
+                            if (shouldTerminate()) throw GateFinishedException()
                         } else {
                             // Gate is closed
                             when (strategy) {
@@ -152,6 +153,7 @@ class ReactiveFlow<T>(
                                 GateStrategy.DROP -> { /* Ignore */
                                 }
                             }
+                            if (shouldTerminate()) throw GateFinishedException()
                         }
                     }
                     is Event.UpstreamComplete -> {

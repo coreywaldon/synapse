@@ -1,6 +1,5 @@
 package com.synapselib.arch.base
 
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
 import com.synapselib.arch.base.provider.Provider
 import com.synapselib.arch.base.provider.ProviderRegistry
@@ -28,6 +27,7 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 // ── Shared Test Infrastructure ──────────────────────────────────────────
@@ -86,7 +86,7 @@ class ContextScopeTest {
 
     @Test
     fun `exposes context and switchboard`() {
-        val sb = DefaultSwitchBoard(scope = testScope)
+        val sb = DefaultSwitchBoard(scope = testScope, providerRegistry = testProviderRegistry())
         val scope = ContextScope("ctx", sb)
         assertEquals("ctx", scope.context)
         assertSame(sb, scope.switchboard)
@@ -97,7 +97,10 @@ class ContextScopeTest {
         assertNull(
             ContextScope<String?>(
                 null,
-                DefaultSwitchBoard(scope = testScope),
+                DefaultSwitchBoard(
+                    scope = testScope,
+                    providerRegistry = testProviderRegistry()
+                ),
             ).context
         )
     }
@@ -422,7 +425,7 @@ class NodeScopeTest {
 
     @Test
     fun `request passes correct params to provider`() = testScope.runTest {
-        val receivedIds = mutableListOf<Int>()
+        val receivedIds = CopyOnWriteArrayList<Int>()
         val registry = ProviderRegistry.Builder()
             .register<TestResult, FetchTestResult> {
                 object : Provider<FetchTestResult, TestResult>() {
@@ -434,8 +437,9 @@ class NodeScopeTest {
             }
             .build()
         val board = DefaultSwitchBoard(
-            scope = CoroutineScope(testDispatcher + Job()),
+            scope = backgroundScope,
             providerRegistry = registry,
+            workerContext = testDispatcher,
         )
 
         val job1 = launch {
@@ -450,7 +454,7 @@ class NodeScopeTest {
         testScheduler.advanceUntilIdle()
         job2.cancel()
 
-        assertEquals(listOf(1, 2), receivedIds)
+        assertEquals(listOf(1, 2), receivedIds.toList())
     }
 
     @Test
@@ -855,7 +859,10 @@ class NodeScopeTest {
 
     @Test
     fun `two switchboards do not leak broadcasts`() = testScope.runTest {
-        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = testProviderRegistry()
+        )
         val otherScope = NodeScope(
             ContextScope("isolated", otherSwitchBoard),
             SimpleMutableState(TestState()),
@@ -883,7 +890,10 @@ class NodeScopeTest {
 
     @Test
     fun `two switchboards do not leak impulses`() = testScope.runTest {
-        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(
+            scope = CoroutineScope(testDispatcher + Job()),
+            providerRegistry = testProviderRegistry()
+        )
         val otherScope = NodeScope(
             ContextScope("isolated", otherSwitchBoard),
             SimpleMutableState(TestState()),

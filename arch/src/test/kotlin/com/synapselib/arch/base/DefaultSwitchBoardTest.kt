@@ -75,7 +75,7 @@ class DefaultSwitchBoardTest {
     // ── Helper: build board with no providers ────────────────────────────
 
     private fun emptyBoard(scope: CoroutineScope) =
-        DefaultSwitchBoard(scope = scope)
+        DefaultSwitchBoard(scope = scope, testProviderRegistry())
 
     // ── Helper: build board with test providers ──────────────────────────
 

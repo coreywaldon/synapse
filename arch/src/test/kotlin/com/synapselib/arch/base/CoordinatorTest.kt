@@ -996,7 +996,7 @@ class CoordinatorScopeTest {
 
     @Test
     fun `two switchboards do not leak broadcasts`() = testScope.runTest {
-        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()), testProviderRegistry())
         val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
 
         val fromFirst = mutableListOf<TestBroadcast>()
@@ -1020,7 +1020,7 @@ class CoordinatorScopeTest {
 
     @Test
     fun `two switchboards do not leak impulses`() = testScope.runTest {
-        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()))
+        val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()), testProviderRegistry())
         val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
 
         val fromFirst = mutableListOf<TestImpulse>()

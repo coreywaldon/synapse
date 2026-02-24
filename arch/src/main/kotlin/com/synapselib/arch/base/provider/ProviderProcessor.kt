@@ -12,6 +12,7 @@ import com.google.devtools.ksp.symbol.KSAnnotated
 import com.google.devtools.ksp.symbol.KSClassDeclaration
 import com.google.devtools.ksp.symbol.KSType
 import com.google.devtools.ksp.symbol.KSTypeArgument
+import com.google.devtools.ksp.symbol.Modifier
 import com.google.devtools.ksp.symbol.Variance
 import com.google.devtools.ksp.validate
 import kotlin.collections.iterator
@@ -237,6 +238,15 @@ class ProviderProcessor(
                 classDecl,
             )
             return null
+        }
+
+        val impulseDecl = impulseType.declaration as? KSClassDeclaration
+        if (impulseDecl != null && !impulseDecl.modifiers.contains(Modifier.DATA)) {
+            logger.error(
+                "DataImpulse '$impulseFqn}' MUST be a data class " +
+                        "to ensure correct request deduplication.",
+                impulseDecl
+            )
         }
 
         // ── Warn if no @Inject constructor ──────────────────────────

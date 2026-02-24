@@ -8,11 +8,16 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.serializer
 
 /**
  * Base type for fire-and-forget events (reactions) that flow through the
@@ -184,7 +189,7 @@ inline fun <C, reified S : Any> ContextScope<C>.Node(
     initialState: S,
     crossinline block: @Composable NodeScope<C, S>.() -> Unit,
 ) : NodeScope<C, S> {
-    val stateHolder = remember { mutableStateOf(initialState) }
+    val stateHolder = rememberState(initialState)
     val coroutineScope = rememberCoroutineScope { Dispatchers.Main.immediate }
     val nodeScope = remember(this, coroutineScope) {
         NodeScope(this, stateHolder, coroutineScope)
@@ -197,6 +202,31 @@ inline fun <C, reified S : Any> ContextScope<C>.Node(
     nodeScope.block()
 
     return nodeScope
+}
+
+inline fun <reified S : Any> serializerOrNull(): KSerializer<S>? {
+    return try {
+        serializer<S>()
+    } catch (_: Exception) {
+        null
+    }
+}
+
+@Composable
+inline fun <reified S : Any> rememberState(
+    initialState: S,
+): MutableState<S> {
+    val ser = serializerOrNull<S>()
+
+    return if (ser != null) {
+        val saver = Saver<S, String>(
+            save = { Json.encodeToString(ser, it) },
+            restore = { Json.decodeFromString(ser, it) },
+        )
+        rememberSaveable(stateSaver = saver) { mutableStateOf(initialState) }
+    } else {
+        remember { mutableStateOf(initialState) }
+    }
 }
 
 /**

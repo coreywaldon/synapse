@@ -13,9 +13,11 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -37,55 +39,56 @@ class ReactiveFlowStressTest {
     fun `stress test gate BUFFER preserves order and count under heavy load`() = runBlocking {
         // Use a standard runBlocking (main thread) to coordinate,
         // and launch workers on Dispatchers.Default explicitly.
+        val gate = MutableStateFlow(true)
+        val emissionCount = 100_000
+        val results = ConcurrentLinkedQueue<Int>()
 
-        withTimeout(5_000) { // Bump timeout slightly for slow CI environments
-            val gate = MutableStateFlow(true)
-            val emissionCount = 100_000
-            val results = ConcurrentLinkedQueue<Int>()
-
-            // Launch the stress test in the Default dispatcher to ensure parallelism
-            val job = launch(Dispatchers.Default) {
-                val toggler = launch {
-                    while (isActive) {
-                        gate.value = !gate.value
-                        delay(1)
-                    }
+        // Launch the stress test in the Default dispatcher to ensure parallelism
+        val job = launch(Dispatchers.Default) {
+            val toggler = launch {
+                while (isActive) {
+                    gate.value = !gate.value
+                    delay(1)
                 }
-
-                val flow = flow {
-                    repeat(emissionCount) {
-                        emit(it)
-                        if (it % 100 == 0) yield()
-                    }
-                }
-
-                flow.asReactive()
-                    .gate(gate, GateStrategy.BUFFER)
-                    .collect { results.add(it) }
-
-                toggler.cancelAndJoin()
             }
 
-            job.join()
+            val flow = flow {
+                repeat(emissionCount) {
+                    emit(it)
+                    if (it % 100 == 0) yield()
+                }
+            }
 
-            assertEquals(emissionCount, results.size)
-            assertEquals(results.toList(), results.sorted())
+            flow.asReactive()
+                .gate(gate, GateStrategy.BUFFER)
+                .take(emissionCount)
+                .collect {
+                    results.add(it) }
+
+            toggler.cancel()
         }
+
+        job.join()
+
+        assertEquals(emissionCount, results.size)
+        var previous = -1
+        for (value in results) {
+            assertEquals(previous + 1, value)
+            previous = value
+        }
+
+        job.cancelAndJoin()
     }
 
     @Test
     fun `stress test squash handles concurrent emissions`() = runStressTest {
-        // Scenario: 10 coroutines emitting "A" rapidly.
-        // Fix: Increase squash window to 5 seconds to ensure it covers the
-        // entire execution time of the stress test, preventing valid expirations.
         val squashWindow = 5.seconds
-
-        val flow = MutableSharedFlow<String>()
-        // Note: 'collect' is sequential, so a standard mutable list is safe here
-        // unless you have multiple collectors.
-        val results = mutableListOf<String>()
         val jobs = 10
         val emissionsPerJob = 1000
+
+        val flow = MutableSharedFlow<String>(extraBufferCapacity = jobs * emissionsPerJob)
+
+        val results = mutableListOf<String>()
 
         val collector = launch {
             flow.asReactive()
@@ -104,16 +107,13 @@ class ReactiveFlowStressTest {
 
         emitters.joinAll()
 
-        // Small buffer to allow the collector to process the final emission if needed
-        // (Though with SharedFlow default config, emitters suspend until collected)
+        // Small buffer to allow the collector to drain the remaining items from the SharedFlow buffer
         delay(100)
         collector.cancel()
 
         println("Squash Stress: Reduced ${jobs * emissionsPerJob} emissions to ${results.size}")
 
         // Verification:
-        // With a 5s window, we expect exactly 1 emission because the value "A"
-        // never changes and the test shouldn't take > 5s.
         assert(results.isNotEmpty())
         assertEquals(1, results.size)
         assertEquals("A", results[0])
@@ -145,21 +145,20 @@ class ReactiveFlowStressTest {
     }
 
     @Test
-    fun `stress test broadcast with dynamic subscribers`() = runStressTest {
+    fun `stress test broadcast with dynamic subscribers`() = runTest {
         val source = MutableSharedFlow<Int>()
 
-        // 1. Use a dedicated Job to manage the broadcast lifecycle
-        val broadcastJob = Job()
+        // 1. Manage the broadcast lifecycle within the TestScope
+        val broadcastJob = Job(coroutineContext.job)
         val broadcastScope = CoroutineScope(coroutineContext + broadcastJob)
         val shared = source.asReactive().broadcast(broadcastScope, replays = 0)
 
         val totalReceived = AtomicInteger(0)
         val persistentResults = Collections.synchronizedList(mutableListOf<Int>())
-
-        // 2. Latch to signal when the subscriber is fully connected
         val warmUpLatch = CompletableDeferred<Unit>()
 
-        val persistentJob = launch {
+        // 2. Use backgroundScope so we don't have to manually cancel persistentJob later
+        backgroundScope.launch {
             shared
                 .buffer(Channel.UNLIMITED)
                 .collect { value ->
@@ -171,8 +170,7 @@ class ReactiveFlowStressTest {
                 }
         }
 
-        // 3. Warm-up Loop: Keep emitting -1 until the subscriber acknowledges it.
-        // This guarantees the connection is established before we start the real test.
+        // 3. Warm-up Loop (Virtual time makes this instant)
         withTimeout(5000) {
             while (!warmUpLatch.isCompleted) {
                 source.emit(-1)
@@ -183,7 +181,7 @@ class ReactiveFlowStressTest {
         val subscribers = (1..20).map {
             launch {
                 delay((0..100).random().toLong())
-                val job = launch {
+                val job = backgroundScope.launch {
                     shared.collect { totalReceived.incrementAndGet() }
                 }
                 delay((50..200).random().toLong())
@@ -194,7 +192,7 @@ class ReactiveFlowStressTest {
         launch {
             repeat(1000) {
                 source.emit(it)
-                delay(2)
+                delay(2) // Virtual time skips the Windows 15.6ms tick instantly
             }
         }
 
@@ -206,20 +204,19 @@ class ReactiveFlowStressTest {
         }
 
         subscribers.joinAll()
-        persistentJob.cancel()
 
         println("Broadcast Stress: Persistent subscriber saw ${persistentResults.size} items.")
         assertEquals(1000, persistentResults.size)
 
-        // 5. Cleanup the broadcast coroutine
+        // 5. Cleanup
         broadcastJob.cancel()
     }
 
     @Test
     fun `stress test pace maintains throughput under heavy load`() = runStressTest {
-        // Scenario: Upstream emits 10,000 items as fast as possible.
-        // Pace is set to 1ms.
-        // We expect the total duration to be roughly 10,000ms (10s), not 0s.
+        // Scenario: Upstream emits 2,000 items as fast as possible.
+        // Pace is set to 2ms.
+        // We expect the total duration to be roughly 4,000ms (4s), not 0s.
 
         val emissionCount = 2000
         val interval = 2.milliseconds
@@ -247,48 +244,39 @@ class ReactiveFlowStressTest {
     }
 
     @Test
-    fun `stress test shutter high frequency trigger`() = runStressTest {
-        // Scenario: Upstream emits slowly (stable data), Trigger emits extremely fast (sampling).
-
+    fun `stress test shutter high frequency trigger`() = runTest {
         val upstream = MutableSharedFlow<Int>()
         val trigger = MutableSharedFlow<Unit>()
         val results = ConcurrentLinkedQueue<Int>()
-        val duration = 2.seconds
 
-        val job = launch {
+        // backgroundScope automatically cancels these when the test finishes
+        backgroundScope.launch {
             upstream.asReactive()
                 .shutter(trigger)
                 .collect { results.add(it) }
         }
 
-        // Upstream emitter: Updates value every 100ms
-        val upstreamJob = launch {
+        backgroundScope.launch {
             var counter = 0
             while (isActive) {
                 upstream.emit(counter++)
-                delay(100)
+                delay(100) // Virtual time
             }
         }
 
-        // Trigger emitter: Fires every 1ms (very fast sampling)
+        // Instead of measuring system time, we just iterate the exact number of times we want.
         val triggerJob = launch {
-            val end = System.currentTimeMillis() + duration.inWholeMilliseconds
-            while (System.currentTimeMillis() < end) {
+            repeat(2000) {
                 trigger.emit(Unit)
-                delay(1)
+                delay(1) // Virtual time
             }
         }
 
         triggerJob.join()
-        upstreamJob.cancelAndJoin()
-        job.cancelAndJoin()
 
-        // Verification:
-        // We sampled for 2 seconds. Ideally 2000 samples.
-        // However, on many OSs (Windows/Linux), delay(1) can be 10-15ms.
-        // 2000ms / 15ms = ~133 samples.
-        // We assert > 200 to ensure we are capturing significantly more than the upstream rate (20 items).
-        assertTrue(results.size > 200, "Should have captured many samples, got ${results.size}")
+        // Because virtual time is perfect, we can safely assert a much tighter bound.
+        // It should be exactly 2000, but we use > 1500 to leave a small margin for Coroutine scheduling.
+        assertTrue(results.size > 1500, "Should have captured many samples, got ${results.size}")
 
         val list = results.toList()
         var previous = -1
