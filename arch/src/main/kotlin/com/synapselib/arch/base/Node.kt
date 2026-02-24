@@ -423,6 +423,7 @@ class NodeScope<C, S : Any>(
         val currentCallback by rememberUpdatedState(callback)
         DisposableEffect(this, key) {
             val stateFlow = switchboard.handleRequest(I::class, Need::class, impulse)
+
             val job = scope.launch {
                 stateFlow.collect { currentCallback(it) }
             }

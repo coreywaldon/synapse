@@ -1,7 +1,6 @@
 package com.synapselib.arch.base
 
 import androidx.compose.runtime.compositionLocalOf
-import com.synapselib.arch.base.addInterceptor
 import com.synapselib.arch.base.provider.ProviderManager
 import com.synapselib.arch.base.provider.ProviderRegistry
 import com.synapselib.core.typed.DataState
@@ -9,10 +8,12 @@ import com.synapselib.core.typed.TypedSharedFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import java.util.concurrent.ConcurrentHashMap
@@ -162,7 +163,7 @@ interface SwitchBoard {
         impulseType: KClass<I>,
         needType: KClass<Need>,
         impulse: I,
-    ): SharedFlow<DataState<Need>>
+    ): Flow<DataState<Need>>
 
     // ── Consume (Downstream-intercepted) ────────────────────────────────
 
@@ -249,7 +250,7 @@ suspend inline fun <reified T : Any> SwitchBoard.triggerImpulse(data: T) =
 /** Reified convenience overload for [SwitchBoard.handleRequest]. */
 inline fun <reified Need : Any, reified I : DataImpulse<Need>> SwitchBoard.handleRequest(
     impulse: I,
-): SharedFlow<DataState<Need>> = handleRequest(I::class, Need::class, impulse)
+): Flow<DataState<Need>> = handleRequest(I::class, Need::class, impulse)
 
 /** Reified convenience overload for [SwitchBoard.addInterceptor]. */
 inline fun <reified T : Any> SwitchBoard.addInterceptor(
@@ -390,7 +391,47 @@ class DefaultSwitchBoard @Inject constructor(
         impulseType: KClass<I>,
         needType: KClass<Need>,
         impulse: I,
-    ): SharedFlow<DataState<Need>> = providerManager.request(impulseType, needType, impulse, switchboard = this)
+    ): Flow<DataState<Need>> = flow {
+        val upstream = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM)
+        val processedImpulse = pipelineFor(upstream).applyInterceptors(impulseType, impulse)
+
+        val providerFlow = try {
+            providerManager.request(
+                impulseType,
+                needType,
+                processedImpulse,
+                switchboard = this@DefaultSwitchBoard
+            )
+        } catch (e: Exception) {
+            emit(DataState.Error(e))
+            return@flow
+        }
+
+        val downstream = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM)
+
+        providerFlow.collect { state ->
+            when (state) {
+                is DataState.Success<Need> -> {
+                    val interceptedData = pipelineFor(downstream).applyInterceptors(needType, state.data)
+                    emit(DataState.Success(interceptedData))
+                }
+
+                is DataState.Error<Need> -> {
+                    val staleData = state.staleData
+                    if (staleData != null) {
+                        val interceptedData = pipelineFor(downstream).applyInterceptors(needType, staleData)
+                        emit(DataState.Error(state.cause, interceptedData))
+                    } else {
+                        emit(DataState.Error(state.cause, null))
+                    }
+                }
+
+                else -> {
+                    emit(state)
+                }
+            }
+        }
+    }
 
     // ── Consume (Downstream-intercepted) ────────────────────────────────
 

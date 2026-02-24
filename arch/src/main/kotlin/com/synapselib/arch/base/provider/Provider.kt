@@ -158,7 +158,7 @@ class ProviderScope(
      */
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: I,
-    ): SharedFlow<DataState<Need>> =
+    ): Flow<DataState<Need>> =
         switchboard.handleRequest(I::class, Need::class, impulse)
 }
 

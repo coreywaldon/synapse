@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -217,7 +218,7 @@ class CoordinatorScope(
      */
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: DataImpulse<Need>,
-    ): SharedFlow<DataState<Need>> = switchboard.handleRequest(impulse)
+    ): Flow<DataState<Need>> = switchboard.handleRequest(impulse)
 
     // ── Handler Overloads (launch + collect) ────────────────────────────
 

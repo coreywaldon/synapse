@@ -856,8 +856,15 @@ class DefaultSwitchBoardTest {
         val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
         val board = emptyBoard(boardScope)
 
-        assertThrows(NoProviderException::class.java) {
-            board.handleRequest(UnregisteredImpulse::class, TestResult::class, UnregisteredImpulse(1))
+        launch {
+            board.handleRequest(
+                UnregisteredImpulse::class,
+                TestResult::class,
+                UnregisteredImpulse(1)
+            ).collect {
+                assertInstanceOf(DataState.Error::class.java, it)
+                assertEquals(NoProviderException::class.java, (it as DataState.Error).cause::class.java)
+            }
         }
     }
 
