@@ -1,8 +1,8 @@
-# Synapse Architecture Documentation
+# Synapse Arch Documentation
 
 ## Overview
 
-**SynapseLib** is a reactive, event-driven architecture for Kotlin/Android applications built on Kotlin Coroutines `SharedFlow`. It provides a central message bus — the **SwitchBoard** — that coordinates three communication channels (**State**, **Reactions/Impulses**, and **Requests**) with a composable interceptor pipeline at every stage.
+**Synapse Arch** is a reactive, event-driven architecture for Kotlin/KMP/Android applications built on Kotlin Coroutines Flows. It provides a central message bus — the **SwitchBoard** — that coordinates three communication channels (**State**, **Reactions/Impulses**, and **Requests**) with a composable interceptor pipeline at every stage.
 
 It integrates with both **Jetpack Compose** (via the `Node`/`CreateContext` DSL) and **non-Compose** contexts (via `Coordinator`), and uses **KSP code generation** to wire data-fetching **Providers** automatically through Hilt or Koin.
 
@@ -208,15 +208,16 @@ flowchart LR
 
     BS["broadcastState()"] --> UP_INT
     TI["triggerImpulse()"] --> UP_INT
+    HR["handleRequest()"] --> UP_INT
     UP_INT --> STATE_FLOW
     UP_INT --> REACT_FLOW
+    UP_INT --> PROV
     STATE_FLOW --> DN_INT
     REACT_FLOW --> DN_INT
+    PROV --> DN_INT
     DN_INT --> SF_OUT["stateFlow()"]
     DN_INT --> IF_OUT["impulseFlow()"]
-
-    HR["handleRequest()"] --> PROV
-    PROV --> DS_OUT["Flow‹DataState‹T››"]
+    DN_INT --> DS_OUT["Flow‹DataState‹T››"]
 ```
 
 **Backing data structures:**
