@@ -1,4 +1,4 @@
-# SynapseLib Architecture Documentation
+# Synapse Architecture Documentation
 
 ## Overview
 

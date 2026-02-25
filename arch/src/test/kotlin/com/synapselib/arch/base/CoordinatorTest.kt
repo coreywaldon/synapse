@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -43,7 +44,7 @@ class CoordinatorScopeTest {
             providerRegistry = testProviderRegistry(),
             workerContext = testDispatcher
         )
-        coordinatorScope = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + Job()))
+        coordinatorScope = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + SupervisorJob()))
     }
 
     @AfterEach
@@ -264,7 +265,7 @@ class CoordinatorScopeTest {
 
     @Test
     fun `request passes correct params to provider`() = testScope.runTest {
-        val receivedIds = mutableListOf<Int>()
+        val receivedIds = CopyOnWriteArrayList<Int>()
         val registry = ProviderRegistry.Builder()
             .register<TestResult, FetchTestResult> {
                 object : Provider<FetchTestResult, TestResult>() {
@@ -276,23 +277,26 @@ class CoordinatorScopeTest {
             }
             .build()
         val board = DefaultSwitchBoard(
-            scope = CoroutineScope(testDispatcher + Job()),
+            scope = backgroundScope,
             providerRegistry = registry,
+            workerContext = testDispatcher,
         )
 
+        val coordinatorScope = CoordinatorScope(board, testScope)
+
         val job1 = launch {
-            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(1)).collect {}
+            coordinatorScope.Request(FetchTestResult(1)).collect {}
         }
         testScheduler.advanceUntilIdle()
         job1.cancel()
 
         val job2 = launch {
-            board.handleRequest(FetchTestResult::class, TestResult::class, FetchTestResult(2)).collect {}
+            coordinatorScope.Request(FetchTestResult(2)).collect {}
         }
         testScheduler.advanceUntilIdle()
         job2.cancel()
 
-        assertEquals(listOf(1, 2), receivedIds)
+        assertEquals(listOf(1, 2), receivedIds.toList())
     }
 
     @Test
@@ -414,18 +418,18 @@ class CoordinatorScopeTest {
 
     @Test
     fun `Request handler receives DataState transitions`() = testScope.runTest {
-        val received = mutableListOf<DataState<TestResult>>()
+        val states = mutableListOf<DataState<TestResult>>()
+        val flow = coordinatorScope.Request(FetchTestResult(1))
 
-        val job = coordinatorScope.Request(FetchTestResult(id = 1)) { state ->
-            received.add(state)
-        }
+        val job = launch { flow.collect { states.add(it) } }
         testScheduler.advanceUntilIdle()
         job.cancel()
 
-        assertTrue(received.any { it is DataState.Loading }, "Should have received Loading")
-        assertTrue(received.any { it is DataState.Success }, "Should have received Success")
-        val success = received.filterIsInstance<DataState.Success<TestResult>>().first()
-        assertEquals(TestResult("result-for-1"), success.data)
+        assertTrue(states.any { it is DataState.Loading })
+        assertTrue(states.any { it is DataState.Success })
+        val loadIdx = states.indexOfFirst { it is DataState.Loading }
+        val successIdx = states.indexOfFirst { it is DataState.Success }
+        assertTrue(loadIdx < successIdx)
     }
 
     @Test

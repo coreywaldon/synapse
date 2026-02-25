@@ -217,7 +217,7 @@ class CoordinatorScope(
      * @return a [SharedFlow] with `replay = 1` emitting intercepted results.
      */
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
-        impulse: DataImpulse<Need>,
+        impulse: I,
     ): Flow<DataState<Need>> = switchboard.handleRequest(impulse)
 
     // ── Handler Overloads (launch + collect) ────────────────────────────
@@ -293,7 +293,7 @@ class CoordinatorScope(
      * @return the [Job] backing this request.
      */
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
-        impulse: DataImpulse<Need>,
+        impulse: I,
         noinline callback: CoordinatorScope.(DataState<Need>) -> Unit,
     ): Job = launch {
         switchboard.handleRequest(impulse).collectLatest { need -> callback(need) }
