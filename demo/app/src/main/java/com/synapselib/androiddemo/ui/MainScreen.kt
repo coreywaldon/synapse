@@ -45,34 +45,6 @@ fun MainScreen() {
     CreateContext(MainScreenContext) {
         val scope = rememberCoroutineScope()
 
-        LocalSwitchBoard.current.addLoggingInterceptors<FetchTasks> {
-            Log.d("INTERCEPT: FetchTasks DataImpulse", it.toString())
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<TaskListState> {
-            Log.d("INTERCEPT: TaskListState Update", it.toString())
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<TaskUpdated> {
-            Log.d("INTERCEPT", "TaskUpdated Impulse $it.toString()")
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<TaskDeleted> {
-            Log.d("INTERCEPT", "TaskDeleted Impulse $it.toString()")
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<TaskFilterChanged> {
-            Log.d("INTERCEPT: TaskFilterUpdated Impulse", it.toString())
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<SortChanged> {
-            Log.d("INTERCEPT: SortChangedImpulse Impulse", it.toString())
-        }
-
-        LocalSwitchBoard.current.addLoggingInterceptors<UpdateAddTaskDialog> {
-            Log.d("INTERCEPT: OpenAddTaskDialog Impulse", it.toString())
-        }
-
         AddTaskDialog()
         DeleteTaskDialog()
 

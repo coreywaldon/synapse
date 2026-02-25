@@ -2,37 +2,33 @@ package com.synapselib.androiddemo.coordinators
 
 import android.util.Log
 import com.synapselib.androiddemo.data.TaskDao
+import com.synapselib.androiddemo.state.FetchTasks
+import com.synapselib.androiddemo.state.SortChanged
 import com.synapselib.androiddemo.state.TaskDeleted
+import com.synapselib.androiddemo.state.TaskFilterChanged
+import com.synapselib.androiddemo.state.TaskListState
 import com.synapselib.androiddemo.state.TaskUpdated
+import com.synapselib.androiddemo.state.UpdateAddTaskDialog
 import com.synapselib.arch.base.Coordinator
 import com.synapselib.arch.base.CoordinatorScope
-import com.synapselib.arch.base.SwitchBoard
+import com.synapselib.arch.base.DefaultSwitchBoard
 import com.synapselib.arch.base.SwitchBoardScope
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class TaskCoordinator @Inject constructor(
-    val taskDao: TaskDao,
+class LoggingCoordinator @Inject constructor(
     @param:SwitchBoardScope val scope: CoroutineScope
 ) {
 
     private var coordinator: CoordinatorScope? = null
 
-    fun initialize(switchBoard: SwitchBoard) {
+    fun initialize(switchBoard: DefaultSwitchBoard) {
         if (coordinator == null) {
             coordinator = Coordinator(switchBoard, scope) {
-                ReactTo<TaskUpdated> {
-                    launch {
-                        taskDao.insertTask(it.task)
-                    }
-                }
-                ReactTo<TaskDeleted> {
-                    launch {
-                        taskDao.deleteTask(it.task)
-                    }
+                switchBoard.setGlobalLogger { point, clazz, data ->
+                    Log.d("${point.channel} - ${point.direction}", "${clazz.simpleName}: $data")
                 }
             }
         } else {
@@ -47,4 +43,3 @@ class TaskCoordinator @Inject constructor(
         coordinator = null
     }
 }
-
