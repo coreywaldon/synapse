@@ -388,7 +388,6 @@ class DefaultSwitchBoard @Inject constructor(
     override suspend fun <T : Any> triggerImpulse(clazz: KClass<T>, data: T) {
         val upstream = InterceptPoint(Channel.REACTION, Direction.UPSTREAM)
         val processed = processAndLog(upstream, clazz, data)
-        processAndLog(upstream, clazz, processed)
         mutableReactionFlow(clazz).emit(processed)
     }
 
