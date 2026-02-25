@@ -29,7 +29,7 @@ mavenPublishing {
     // Signs artifacts using GPG_SIGNING_KEY and GPG_PASSWORD env variables automatically
     signAllPublications()
 
-    coordinates(group.toString(), "synapse-lib", version.toString())
+    coordinates(group.toString(), "core", version.toString())
 
     pom {
         name.set("SynapseLib")
