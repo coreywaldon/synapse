@@ -2,7 +2,7 @@ import com.vanniktech.maven.publish.SonatypeHost
 
 plugins {
     id("buildsrc.convention.kotlin-jvm")
-    id("com.vanniktech.maven.publish") version "0.30.0"
+    id("com.vanniktech.maven.publish")
     signing
     application
 }
@@ -29,7 +29,7 @@ mavenPublishing {
     // Signs artifacts using GPG_SIGNING_KEY and GPG_PASSWORD env variables automatically
     signAllPublications()
 
-    coordinates(group.toString(), "synapse-lib", version.toString())
+    coordinates(group.toString(), "core", version.toString())
 
     pom {
         name.set("SynapseLib")

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="blue_200">#93C5FD</color>
+    <color name="blue_500">#3B82F6</color>
+    <color name="blue_700">#1D4ED8</color>
+
+    <color name="emerald_200">#6EE7B7</color>
+    <color name="emerald_500">#10B981</color>
+    <color name="emerald_700">#047857</color>
+
+    <color name="slate_50">#F8FAFC</color>
+    <color name="slate_900">#0F172A</color>
+
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+</resources>
