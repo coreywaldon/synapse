@@ -39,4 +39,4 @@ package com.synapselib.arch.base
  * @param Need the type of data this impulse requests. Must be a non-nullable
  *             [Any] subtype.
  */
-abstract class DataImpulse<out Need : Any>
+open class DataImpulse<out Need : Any>: Impulse()

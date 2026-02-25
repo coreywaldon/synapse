@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Qualifier
 import kotlin.coroutines.CoroutineContext
@@ -346,6 +347,9 @@ class DefaultSwitchBoard @Inject constructor(
     /** Cached downstream-intercepted impulse flows, one per type. All consumers share this instance. */
     private val downstreamImpulseFlows = ConcurrentHashMap<KClass<*>, SharedFlow<Any>>()
 
+    /** Global logger that will intercept all flows, upstream and downstream read-only **/
+    private val globalLogger = AtomicReference<((InterceptPoint, KClass<*>, Any) -> Unit)?>(null)
+
     /**
      * Interceptor registries keyed by [InterceptPoint].
      *
@@ -377,13 +381,14 @@ class DefaultSwitchBoard @Inject constructor(
 
     override suspend fun <T : Any> broadcastState(clazz: KClass<T>, data: T) {
         val upstream = InterceptPoint(Channel.STATE, Direction.UPSTREAM)
-        val processed = pipelineFor(upstream).applyInterceptors(clazz, data)
+        val processed = processAndLog(upstream, clazz, data)
         mutableStateFlow(clazz).emit(processed)
     }
 
     override suspend fun <T : Any> triggerImpulse(clazz: KClass<T>, data: T) {
         val upstream = InterceptPoint(Channel.REACTION, Direction.UPSTREAM)
-        val processed = pipelineFor(upstream).applyInterceptors(clazz, data)
+        val processed = processAndLog(upstream, clazz, data)
+        processAndLog(upstream, clazz, processed)
         mutableReactionFlow(clazz).emit(processed)
     }
 
@@ -393,7 +398,7 @@ class DefaultSwitchBoard @Inject constructor(
         impulse: I,
     ): Flow<DataState<Need>> = flow {
         val upstream = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM)
-        val processedImpulse = pipelineFor(upstream).applyInterceptors(impulseType, impulse)
+        val processedImpulse = processAndLog(upstream, impulseType, impulse)
 
         val providerFlow = try {
             providerManager.request(
@@ -408,18 +413,17 @@ class DefaultSwitchBoard @Inject constructor(
         }
 
         val downstream = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM)
-
         providerFlow.collect { state ->
             when (state) {
                 is DataState.Success<Need> -> {
-                    val interceptedData = pipelineFor(downstream).applyInterceptors(needType, state.data)
+                    val interceptedData = processAndLog(downstream, needType, state.data)
                     emit(DataState.Success(interceptedData))
                 }
 
                 is DataState.Error<Need> -> {
                     val staleData = state.staleData
                     if (staleData != null) {
-                        val interceptedData = pipelineFor(downstream).applyInterceptors(needType, staleData)
+                        val interceptedData = processAndLog(downstream, needType, staleData)
                         emit(DataState.Error(state.cause, interceptedData))
                     } else {
                         emit(DataState.Error(state.cause, null))
@@ -427,6 +431,7 @@ class DefaultSwitchBoard @Inject constructor(
                 }
 
                 else -> {
+                    processAndLog(downstream, needType, state)
                     emit(state)
                 }
             }
@@ -439,7 +444,7 @@ class DefaultSwitchBoard @Inject constructor(
         val shared = downstreamStateFlows.computeIfAbsent(clazz) {
             val downstream = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM)
             mutableStateFlow(clazz)
-                .map { pipelineFor(downstream).applyInterceptors(clazz, clazz.java.cast(it)) }
+                .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
                 .shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis), replay = 1)
         }
         return TypedSharedFlow(shared, clazz)
@@ -449,7 +454,7 @@ class DefaultSwitchBoard @Inject constructor(
         val shared = downstreamImpulseFlows.computeIfAbsent(clazz) {
             val downstream = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM)
             mutableReactionFlow(clazz)
-                .map { pipelineFor(downstream).applyInterceptors(clazz, clazz.java.cast(it)) }
+                .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
                 .shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis), replay = 0)
         }
         return TypedSharedFlow(shared, clazz)
@@ -471,6 +476,34 @@ class DefaultSwitchBoard @Inject constructor(
         interceptor: Interceptor<T>,
         priority: Int,
     ): Registration = registryFor(point).add(clazz, interceptor, priority)
+
+    /**
+     * Sets a global logger that will be invoked for ALL data passing through the
+     * [SwitchBoard], regardless of type, channel, or direction.
+     *
+     * This is useful for debugging, analytics, or global monitoring without needing
+     * to register type-specific interceptors.
+     *
+     * @param logger A function that receives the [InterceptPoint], the [KClass] of the data, and the data itself.
+     */
+    fun setGlobalLogger(logger: ((point: InterceptPoint, clazz: KClass<*>, data: Any) -> Unit)?)  {
+        globalLogger.set(logger)
+    }
+
+    /**
+     * Processes the provided data through the interceptor pipeline associated with the given intercept point
+     * and class, then logs the result using the global logger, if one is set.
+     *
+     * @param point The intercept point specifying where in the processing pipeline the data will be handled.
+     * @param clazz The [KClass] of the data type being processed.
+     * @param data The input data to process through the interceptors.
+     * @return The processed data after it has passed through the interceptor pipeline.
+     */
+    private suspend fun <T : Any> processAndLog(point: InterceptPoint, clazz: KClass<out T>, data: T): T {
+        val processed = pipelineFor(point).applyInterceptors(clazz, data)
+        globalLogger.get()?.invoke(point, clazz, processed)
+        return processed
+    }
 
     // ── Empty Pipeline Singleton ────────────────────────────────────────
 
