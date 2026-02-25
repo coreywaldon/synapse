@@ -1,0 +1,14 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.AndroidDemo" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/blue_200</item>
+        <item name="colorPrimaryVariant">@color/blue_700</item>
+        <item name="colorOnPrimary">@color/slate_900</item>
+
+        <item name="colorSecondary">@color/emerald_200</item>
+        <item name="colorSecondaryVariant">@color/emerald_200</item>
+        <item name="colorOnSecondary">@color/slate_900</item>
+
+        <item name="android:statusBarColor">@color/slate_900</item>
+        <item name="android:windowBackground">@color/slate_900</item>
+    </style>
+</resources>

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="GradleMigrationSettings" migrationVersion="1" />
+  <component name="GradleSettings">
+    <option name="linkedExternalProjectsSettings">
+      <GradleProjectSettings>
+        <compositeConfiguration>
+          <compositeBuild compositeDefinitionSource="SCRIPT">
+            <builds>
+              <build path="$PROJECT_DIR$/../Synapse" name="Synapse">
+                <projects>
+                  <project path="$PROJECT_DIR$/../Synapse" />
+                  <project path="$PROJECT_DIR$/../Synapse/arch" />
+                  <project path="$PROJECT_DIR$/../Synapse/core" />
+                </projects>
+              </build>
+              <build path="$PROJECT_DIR$/../Synapse/buildSrc" name="buildSrc">
+                <projects>
+                  <project path="$PROJECT_DIR$/../Synapse/buildSrc" />
+                </projects>
+              </build>
+            </builds>
+          </compositeBuild>
+        </compositeConfiguration>
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="gradleJvm" value="#JAVA_HOME" />
+        <option name="modules">
+          <set>
+            <option value="$PROJECT_DIR$" />
+            <option value="$PROJECT_DIR$/app" />
+            <option value="$PROJECT_DIR$/../Synapse" />
+            <option value="$PROJECT_DIR$/../Synapse/arch" />
+            <option value="$PROJECT_DIR$/../Synapse/buildSrc" />
+            <option value="$PROJECT_DIR$/../Synapse/core" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+    </option>
+  </component>
+</project>
