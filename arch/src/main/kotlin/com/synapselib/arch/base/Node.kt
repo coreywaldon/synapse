@@ -41,7 +41,7 @@ open class Impulse
  * Top-level composable that establishes a **context boundary** for the
  * SynapseLib DSL.
  *
- * A context pairs an arbitrary value [context] (typically a ViewModel, config
+ * A context pairs an arbitrary value [context] (typically a state, config
  * object, or domain model) with the nearest [SwitchBoard] from the composition,
  * wrapping them in a [ContextScope] that child [Node]s can access.
  *
@@ -49,12 +49,12 @@ open class Impulse
  *
  * ```kotlin
  * @Composable
- * fun MyFeature(viewModel: MyViewModel) {
- *     CreateContext(viewModel) {
+ * fun MyFeature() {
+ *     CreateContext(myState) {
  *         // `this` is ContextScope<MyViewModel>
  *         Node(initialState = UiState()) {
  *             // `this` is NodeScope<MyViewModel, UiState>
- *             // context == viewModel
+ *             // context == myState
  *         }
  *     }
  * }
@@ -154,7 +154,7 @@ class ContextScope<T>(
  * ### Usage
  *
  * ```kotlin
- * CreateContext(viewModel) {
+ * CreateContext(myState) {
  *     Node(initialState = ScreenState()) {
  *         // Read state
  *         Text("Count: ${state.count}")
