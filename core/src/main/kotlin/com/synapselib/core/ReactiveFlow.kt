@@ -122,6 +122,8 @@ class ReactiveFlow<T>(
                                 }
                             }
                         }
+
+                        if (shouldTerminate()) throw GateFinishedException()
                     }
 
                     is Event.Data -> {

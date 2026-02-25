@@ -27,7 +27,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:synapse-lib:1.0.0")
+    implementation("com.synapselib:synapse-lib:1.0.1")
 }
 ```
 
@@ -36,9 +36,6 @@ dependencies {
 You can wrap any existing `Flow` using `.asReactive()` or use the provided extension functions directly.
 
 ```kotlin
-import com.synapselib.core.asReactive
-import com.synapselib.core.gate
-
 // Example: A robust analytics tracker that buffers when offline
 // and prevents spamming the server.
 analyticsEvents

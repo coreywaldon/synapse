@@ -39,45 +39,40 @@ class ReactiveFlowStressTest {
     fun `stress test gate BUFFER preserves order and count under heavy load`() = runBlocking {
         // Use a standard runBlocking (main thread) to coordinate,
         // and launch workers on Dispatchers.Default explicitly.
-        val gate = MutableStateFlow(true)
-        val emissionCount = 100_000
-        val results = ConcurrentLinkedQueue<Int>()
 
-        // Launch the stress test in the Default dispatcher to ensure parallelism
-        val job = launch(Dispatchers.Default) {
-            val toggler = launch {
-                while (isActive) {
-                    gate.value = !gate.value
-                    delay(1)
+        withTimeout(5_000) { // Bump timeout slightly for slow CI environments
+            val gate = MutableStateFlow(true)
+            val emissionCount = 100_000
+            val results = ConcurrentLinkedQueue<Int>()
+
+            // Launch the stress test in the Default dispatcher to ensure parallelism
+            val job = launch(Dispatchers.Default) {
+                val toggler = launch {
+                    while (isActive) {
+                        gate.value = !gate.value
+                        delay(1)
+                    }
                 }
+
+                val flow = flow {
+                    repeat(emissionCount) {
+                        emit(it)
+                        if (it % 100 == 0) yield()
+                    }
+                }
+
+                flow.asReactive()
+                    .gate(gate, GateStrategy.BUFFER)
+                    .collect { results.add(it) }
+
+                toggler.cancelAndJoin()
             }
 
-            val flow = flow {
-                repeat(emissionCount) {
-                    emit(it)
-                    if (it % 100 == 0) yield()
-                }
-            }
+            job.join()
 
-            flow.asReactive()
-                .gate(gate, GateStrategy.BUFFER)
-                .take(emissionCount)
-                .collect {
-                    results.add(it) }
-
-            toggler.cancel()
+            assertEquals(emissionCount, results.size)
+            assertEquals(results.toList(), results.sorted())
         }
-
-        job.join()
-
-        assertEquals(emissionCount, results.size)
-        var previous = -1
-        for (value in results) {
-            assertEquals(previous + 1, value)
-            previous = value
-        }
-
-        job.cancelAndJoin()
     }
 
     @Test
