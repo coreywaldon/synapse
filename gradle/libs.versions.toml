@@ -7,12 +7,14 @@ kotlin = "2.2.21"
 kotlinxDatetime = "0.7.1"
 kotlinxSerializationJSON = "1.9.0"
 kotlinxCoroutines = "1.10.2"
+runtimeDesktop = "1.10.2"
 
 [libraries]
 kotlinGradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
 kotlinxDatetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinxDatetime" }
 kotlinxSerialization = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJSON" }
 kotlinxCoroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+runtimeDesktop = { group = "androidx.compose.runtime", name = "runtime-desktop", version.ref = "runtimeDesktop" }
 
 # Libraries can be bundled together for easier import
 [bundles]
