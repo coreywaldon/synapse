@@ -1,7 +1,7 @@
-# Synapse
+# Synapse Core
 
 ![Maven Central](https://img.shields.io/maven-central/v/com.synapselib/core)
-![Kotlin](https://img.shields.io/badge/kotlin-1.9.0-blue.svg?logo=kotlin)
+![Kotlin](https://img.shields.io/badge/kotlin-1.10.0-blue.svg?logo=kotlin)
 ![License](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 
