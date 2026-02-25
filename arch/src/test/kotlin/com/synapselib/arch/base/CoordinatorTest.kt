@@ -1049,7 +1049,7 @@ class CoordinatorScopeTest {
     @Test
     fun `two switchboards request providers independently`() = testScope.runTest {
         val otherSwitchBoard = DefaultSwitchBoard(
-            scope = CoroutineScope(testDispatcher + Job()),
+            scope = backgroundScope,
             providerRegistry = testProviderRegistry(
                 fetchResult = { TestResult("from-second-$it") },
             ),
