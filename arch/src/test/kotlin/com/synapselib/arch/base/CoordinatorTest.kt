@@ -1,5 +1,8 @@
 package com.synapselib.arch.base
 
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import com.synapselib.arch.base.provider.Provider
 import com.synapselib.arch.base.provider.ProviderRegistry
 import com.synapselib.arch.base.provider.ProviderScope
@@ -19,6 +22,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -27,24 +31,49 @@ import org.junit.jupiter.api.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * A minimal [LifecycleOwner] for tests. Starts in [Lifecycle.State.RESUMED]
+ * so that `lifecycleScope` is immediately active. Call [destroy] to move the
+ * lifecycle to [Lifecycle.State.DESTROYED], which triggers auto-dispose on
+ * any attached [CoordinatorScope].
+ */
+private class TestLifecycleOwner : LifecycleOwner {
+    val registry = LifecycleRegistry(this)
+    override val lifecycle: Lifecycle get() = registry
+
+    init {
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+    }
+
+    fun destroy() {
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+    }
+}
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class CoordinatorScopeTest {
 
     private val testDispatcher = UnconfinedTestDispatcher()
     private val testScope = TestScope(testDispatcher)
     private lateinit var switchBoard: DefaultSwitchBoard
+    private lateinit var lifecycleOwner: TestLifecycleOwner
     private lateinit var coordinatorScope: CoordinatorScope
 
     @BeforeEach
     fun setup() {
-        val testDispatcher = UnconfinedTestDispatcher()
+        Dispatchers.setMain(testDispatcher)
         val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
         switchBoard = DefaultSwitchBoard(
             scope = boardScope,
             providerRegistry = testProviderRegistry(),
             workerContext = testDispatcher
         )
-        coordinatorScope = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + SupervisorJob()))
+        lifecycleOwner = TestLifecycleOwner()
+        coordinatorScope = CoordinatorScope(switchBoard, lifecycleOwner)
     }
 
     @AfterEach
@@ -57,7 +86,8 @@ class CoordinatorScopeTest {
     @Test
     fun `Coordinator factory runs block and returns scope`() {
         var blockRan = false
-        val scope = Coordinator(switchBoard, CoroutineScope(testDispatcher + Job())) {
+        val owner = TestLifecycleOwner()
+        val scope = Coordinator(switchBoard, owner) {
             blockRan = true
         }
         assertTrue(blockRan)
@@ -282,7 +312,8 @@ class CoordinatorScopeTest {
             workerContext = testDispatcher,
         )
 
-        val coordinatorScope = CoordinatorScope(board, testScope)
+        val owner = TestLifecycleOwner()
+        val coordinatorScope = CoordinatorScope(board, owner)
 
         val job1 = launch {
             coordinatorScope.Request(FetchTestResult(1)).collect {}
@@ -538,8 +569,8 @@ class CoordinatorScopeTest {
 
     @Test
     fun `dispose cancels coroutine job and child jobs`() = testScope.runTest {
-        val scope = CoroutineScope(testDispatcher + Job())
-        val coord = CoordinatorScope(switchBoard, scope)
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
 
         val received = mutableListOf<TestImpulse>()
         coord.ReactTo<TestImpulse> { received.add(it) }
@@ -562,6 +593,71 @@ class CoordinatorScopeTest {
         assertEquals(listOf(TestImpulse("before-dispose")), received)
         // External listener still works — switchboard is not affected
         assertEquals(listOf(TestImpulse("after-dispose")), externalReceived)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Lifecycle auto-dispose
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `ON_DESTROY auto-disposes interceptors`() = runTest {
+        val registry = InterceptorRegistry()
+        val counter = AtomicInteger(0)
+
+        coordinatorScope.registrations.add(
+            registry.add(Interceptor.read<TestBroadcast> { counter.incrementAndGet() })
+        )
+
+        registry.applyInterceptors(TestBroadcast("before"))
+        assertEquals(1, counter.get())
+
+        lifecycleOwner.destroy()
+        counter.set(0)
+
+        registry.applyInterceptors(TestBroadcast("after"))
+        assertEquals(0, counter.get())
+        assertTrue(coordinatorScope.registrations.isEmpty())
+    }
+
+    @Test
+    fun `ON_DESTROY cancels child coroutines`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+
+        val received = mutableListOf<TestImpulse>()
+        coord.ReactTo<TestImpulse> { received.add(it) }
+
+        coord.Trigger(TestImpulse("before-destroy"))
+        testScheduler.advanceUntilIdle()
+
+        owner.destroy()
+
+        val externalReceived = mutableListOf<TestImpulse>()
+        val externalJob = launch {
+            switchBoard.impulseFlow(TestImpulse::class).collect { externalReceived.add(it) }
+        }
+        switchBoard.triggerImpulse(TestImpulse("after-destroy"))
+        testScheduler.advanceUntilIdle()
+        externalJob.cancel()
+
+        assertEquals(listOf(TestImpulse("before-destroy")), received)
+        assertEquals(listOf(TestImpulse("after-destroy")), externalReceived)
+    }
+
+    @Test
+    fun `manual dispose before ON_DESTROY is safe`() = runTest {
+        val registry = InterceptorRegistry()
+        val counter = AtomicInteger(0)
+
+        coordinatorScope.registrations.add(
+            registry.add(Interceptor.read<TestBroadcast> { counter.incrementAndGet() })
+        )
+
+        coordinatorScope.dispose()
+        lifecycleOwner.destroy() // should not throw
+
+        registry.applyInterceptors(TestBroadcast("after"))
+        assertEquals(0, counter.get())
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -709,7 +805,8 @@ class CoordinatorScopeTest {
         val counter1 = AtomicInteger(0)
         val counter2 = AtomicInteger(0)
 
-        val otherScope = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + Job()))
+        val otherOwner = TestLifecycleOwner()
+        val otherScope = CoordinatorScope(switchBoard, otherOwner)
 
         coordinatorScope.registrations.add(
             registry.add(Interceptor.read<TestBroadcast> { counter1.incrementAndGet() })
@@ -793,7 +890,8 @@ class CoordinatorScopeTest {
 
     @Test
     fun `concurrent broadcasts from multiple scopes interleave correctly`() = testScope.runTest {
-        val scope2 = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + Job()))
+        val owner2 = TestLifecycleOwner()
+        val scope2 = CoordinatorScope(switchBoard, owner2)
 
         val received = mutableListOf<TestBroadcast>()
         val job = launch {
@@ -836,7 +934,8 @@ class CoordinatorScopeTest {
 
     @Test
     fun `triggers from multiple scopes all arrive`() = testScope.runTest {
-        val scope2 = CoordinatorScope(switchBoard, CoroutineScope(testDispatcher + Job()))
+        val owner2 = TestLifecycleOwner()
+        val scope2 = CoordinatorScope(switchBoard, owner2)
 
         val received = mutableListOf<TestImpulse>()
         val job = launch {
@@ -1001,7 +1100,8 @@ class CoordinatorScopeTest {
     @Test
     fun `two switchboards do not leak broadcasts`() = testScope.runTest {
         val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()), testProviderRegistry())
-        val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
+        val otherOwner = TestLifecycleOwner()
+        val otherCoord = CoordinatorScope(otherSwitchBoard, otherOwner)
 
         val fromFirst = mutableListOf<TestBroadcast>()
         val fromSecond = mutableListOf<TestBroadcast>()
@@ -1025,7 +1125,8 @@ class CoordinatorScopeTest {
     @Test
     fun `two switchboards do not leak impulses`() = testScope.runTest {
         val otherSwitchBoard = DefaultSwitchBoard(scope = CoroutineScope(testDispatcher + Job()), testProviderRegistry())
-        val otherCoord = CoordinatorScope(otherSwitchBoard, CoroutineScope(testDispatcher + Job()))
+        val otherOwner = TestLifecycleOwner()
+        val otherCoord = CoordinatorScope(otherSwitchBoard, otherOwner)
 
         val fromFirst = mutableListOf<TestImpulse>()
         val fromSecond = mutableListOf<TestImpulse>()

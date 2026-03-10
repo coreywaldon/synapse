@@ -1,14 +1,18 @@
 package com.synapselib.androiddemo.coordinators
 
-import android.util.Log
+import androidx.lifecycle.LifecycleOwner
 import com.synapselib.androiddemo.data.TaskDao
+import com.synapselib.androiddemo.state.SortChanged
 import com.synapselib.androiddemo.state.TaskDeleted
 import com.synapselib.androiddemo.state.TaskUpdated
+import com.synapselib.arch.base.Channel
 import com.synapselib.arch.base.Coordinator
 import com.synapselib.arch.base.CoordinatorScope
+import com.synapselib.arch.base.Direction
+import com.synapselib.arch.base.Impulse
+import com.synapselib.arch.base.InterceptPoint
+import com.synapselib.arch.base.Interceptor
 import com.synapselib.arch.base.SwitchBoard
-import com.synapselib.arch.base.SwitchBoardScope
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -16,14 +20,14 @@ import javax.inject.Singleton
 @Singleton
 class TaskCoordinator @Inject constructor(
     val taskDao: TaskDao,
-    @param:SwitchBoardScope val scope: CoroutineScope
+    val lifecycleOwner: LifecycleOwner,
 ) {
 
     private var coordinator: CoordinatorScope? = null
 
     fun initialize(switchBoard: SwitchBoard) {
         if (coordinator == null) {
-            coordinator = Coordinator(switchBoard, scope) {
+            coordinator = Coordinator(switchBoard, lifecycleOwner) {
                 ReactTo<TaskUpdated> {
                     launch {
                         taskDao.insertTask(it.task)
@@ -34,6 +38,11 @@ class TaskCoordinator @Inject constructor(
                         taskDao.deleteTask(it.task)
                     }
                 }
+
+                Intercept<Any>(InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
+                    Interceptor.read {
+                        println("Intercepted ${it::class.simpleName}")
+                    })
             }
         } else {
             coordinator?.dispose()

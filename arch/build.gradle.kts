@@ -20,6 +20,9 @@ dependencies {
     implementation("org.jetbrains.compose.runtime:runtime:1.10.1")
     implementation("org.jetbrains.compose.foundation:foundation:1.10.1")
 
+    implementation("androidx.lifecycle:lifecycle-common:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime:2.8.7")
+
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
 

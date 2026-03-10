@@ -1,50 +1,53 @@
 package com.synapselib.arch.base
 
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
 import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
- * Creates a long-lived [CoordinatorScope] and runs [block] with it as the
+ * Creates a lifecycle-aware [CoordinatorScope] and runs [block] with it as the
  * receiver, mirroring the [Node] DSL for non-Compose contexts.
  *
  * This is the primary entry point for wiring up [SwitchBoard] communication
- * outside a Compose composition — typically from an activity, service,
+ * outside a Compose composition — typically from an activity, fragment, service,
  * or background process.
  *
+ * The coordinator automatically [disposes][CoordinatorScope.dispose] itself when
+ * the [owner]'s lifecycle reaches [Lifecycle.Event.ON_DESTROY], so manual
+ * cleanup is not required in most cases.
  *
  * @param switchboard the [SwitchBoard] this coordinator communicates through.
- * @param scope       optional externally-managed [CoroutineScope] (e.g.
- *                    `viewModelScope`). If not provided, a new scope with a
- *                    [SupervisorJob] on [Dispatchers.Main] is created.
- *                    When an external scope is supplied, [CoordinatorScope.dispose]
- *                    will cancel only the jobs it owns; the parent scope's
- *                    lifecycle is unaffected.
+ * @param owner       the [LifecycleOwner] whose lifecycle governs this
+ *                    coordinator's lifespan. The coordinator will auto-dispose
+ *                    on [Lifecycle.Event.ON_DESTROY].
  * @param block       initialization block — wire up listeners, interceptors, and
  *                    initial broadcasts here. Runs synchronously before the
  *                    function returns.
  * @return the fully initialized [CoordinatorScope]. Call
  *         [CoordinatorScope.dispose] to cancel all jobs and unregister all
- *         interceptors.
+ *         interceptors (also happens automatically on ON_DESTROY).
  */
 fun Coordinator(
     switchboard: SwitchBoard,
-    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+    owner: LifecycleOwner,
     block: CoordinatorScope.() -> Unit,
-): CoordinatorScope = CoordinatorScope(switchboard, scope).apply(block)
+): CoordinatorScope = CoordinatorScope(switchboard, owner).apply(block)
 
 /**
- * A long-lived, non-Compose counterpart to [NodeScope].
+ * A long-lived, lifecycle-aware, non-Compose counterpart to [NodeScope].
  *
  * Provides the same [SwitchBoard] capabilities — broadcasting state,
  * triggering reactions, listening, requesting, and intercepting — with a
- * **manually managed lifecycle** instead of Compose's `DisposableEffect`.
+ * **lifecycle-managed lifespan** that auto-disposes on
+ * [Lifecycle.Event.ON_DESTROY].
  *
  * ## Capabilities
  *
@@ -71,7 +74,7 @@ fun Coordinator(
  * handler receivers:
  *
  * ```kotlin
- * val coordinator = Coordinator(switchboard) {
+ * val coordinator = Coordinator(switchboard, viewLifecycleOwner) {
  *     ReactTo<DataRefreshRequested> {
  *         launch { Broadcast(fetchLatestData()) }
  *     }
@@ -80,20 +83,24 @@ fun Coordinator(
  *
  * ## Lifecycle
  *
- * Call [dispose] when the coordinator is no longer needed. This will:
+ * The coordinator observes the provided [LifecycleOwner] and automatically
+ * calls [dispose] when the lifecycle reaches [Lifecycle.Event.ON_DESTROY].
+ * You may also call [dispose] manually at any time if earlier cleanup is
+ * needed.
+ *
+ * [dispose] will:
  * 1. Cancel the backing coroutine job (and all child jobs/listeners).
  * 2. Unregister all interceptors added via [Intercept].
  * 3. Clear the internal registration list.
+ * 4. Remove the lifecycle observer.
  *
  * @param switchboard    the [SwitchBoard] this scope communicates through.
- * @param coroutineScope the backing [CoroutineScope] for structured concurrency.
- *                       Defaults to a new scope with [SupervisorJob] on
- *                       [Dispatchers.Main].
+ * @param owner          the [LifecycleOwner] governing this coordinator's lifespan.
  */
 class CoordinatorScope(
     val switchboard: SwitchBoard,
-    coroutineScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
-) : CoroutineScope by coroutineScope {
+    private val owner: LifecycleOwner,
+) : CoroutineScope by owner.lifecycleScope {
 
     /**
      * Accumulated interceptor registrations that will be
@@ -101,6 +108,19 @@ class CoordinatorScope(
      */
     @PublishedApi
     internal val registrations = mutableListOf<Registration>()
+
+    /**
+     * Lifecycle observer that triggers [dispose] on ON_DESTROY.
+     */
+    private val lifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onDestroy(owner: LifecycleOwner) {
+            dispose()
+        }
+    }
+
+    init {
+        owner.lifecycle.addObserver(lifecycleObserver)
+    }
 
     // ── Interceptor Registration ────────────────────────────────────────
 
@@ -209,7 +229,7 @@ class CoordinatorScope(
      * Returns the downstream-intercepted [SharedFlow] for the result of
      * routing [impulse] through the [SwitchBoard]'s request pipeline.
      *
-     * Use this overload when you need access to the raw flow
+     * Use this overload when you need access to the raw flow.
      *
      * @param Need     the expected result type from the request handler.
      * @param I        the [Impulse] subtype describing the request.
@@ -309,6 +329,11 @@ class CoordinatorScope(
      *    (listeners, in-flight requests, etc.).
      * 2. **Unregisters** every interceptor that was added via [Intercept].
      * 3. **Clears** the internal registration list.
+     * 4. **Removes** the lifecycle observer from the [LifecycleOwner].
+     *
+     * This is called automatically when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_DESTROY]. You may also call it manually for
+     * earlier cleanup.
      *
      * After calling [dispose], the scope is no longer usable — launching new
      * coroutines or registering interceptors will fail with a
@@ -320,5 +345,6 @@ class CoordinatorScope(
         coroutineContext[Job]?.cancel()
         registrations.forEach { it.unregister() }
         registrations.clear()
+        owner.lifecycle.removeObserver(lifecycleObserver)
     }
 }

@@ -34,6 +34,7 @@ fun ContextScope<ScreenContext>.DeleteTaskDialog() {
         ReactTo<UpdateDeleteDialog> { dialogUpdate ->
             update { it.copy(showDialog = dialogUpdate.showDialog, task = dialogUpdate.task) }
         }
+
         if (state.showDialog) {
             state.task?.let { task ->
                 AlertDialog(
