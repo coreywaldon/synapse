@@ -350,6 +350,15 @@ class DefaultSwitchBoard @Inject constructor(
     /** Global logger that will intercept all flows, upstream and downstream read-only **/
     private val globalLogger = AtomicReference<((InterceptPoint, KClass<*>, Any) -> Unit)?>(null)
 
+    /** The sharing strategy **/
+    private var sharingStarted: SharingStarted =                                                                      
+          SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis)                                     
+                                                                                                                        
+    /** Call before any flow is consumed. Intended for testing. */                                                    
+    fun setEagerSharing() {                                                                                           
+      sharingStarted = SharingStarted.Eagerly                                                                       
+    } 
+
     /**
      * Interceptor registries keyed by [InterceptPoint].
      *
@@ -444,7 +453,7 @@ class DefaultSwitchBoard @Inject constructor(
             val downstream = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM)
             mutableStateFlow(clazz)
                 .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
-                .shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis), replay = 1)
+                .shareIn(scope, sharingStarted, replay = 1)
         }
         return TypedSharedFlow(shared, clazz)
     }
@@ -454,7 +463,7 @@ class DefaultSwitchBoard @Inject constructor(
             val downstream = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM)
             mutableReactionFlow(clazz)
                 .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
-                .shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis), replay = 0)
+                .shareIn(scope, sharingStarted, replay = 0)
         }
         return TypedSharedFlow(shared, clazz)
     }
