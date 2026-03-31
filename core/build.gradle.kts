@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.synapselib"
-version = "1.0.4"
+version = "1.0.5"
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")

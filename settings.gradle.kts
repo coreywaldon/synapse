@@ -31,6 +31,7 @@ plugins {
 }
 
 include(":core")
+include(":arch")
+include(":arch-test")
 
 rootProject.name = "Synapse"
-include("arch")
