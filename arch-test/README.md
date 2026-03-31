@@ -6,7 +6,7 @@ Testing utilities for the [Synapse](https://github.com/coreywaldon/synapse) arch
 
 ```kotlin
 // build.gradle.kts
-testImplementation("com.synapselib:arch-test:1.0.5")
+testImplementation("com.synapselib:arch-test:1.0.6")
 ```
 
 The artifact transitively pulls in `synapse-arch`, `synapse-core`, `kotlinx-coroutines-test`, and `junit:junit:4`.
