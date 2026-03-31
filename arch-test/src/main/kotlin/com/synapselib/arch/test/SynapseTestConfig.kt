@@ -13,8 +13,8 @@ import kotlinx.coroutines.flow.flow
  * ```kotlin
  * @get:Rule
  * val synapse = SynapseTestRule {
- *     provide<FetchAddresses, List<Address>> { testAddresses }
- *     provide<FetchCachedToken, AuthToken> { null } // emit nothing
+ *     provide<List<Address>, FetchAddresses> { testAddresses }
+ *     provide<AuthToken, FetchCachedToken> { null } // emit nothing
  * }
  * ```
  */
@@ -30,8 +30,8 @@ class SynapseTestConfig {
      * which is useful for stubbing providers that should not produce data.
      *
      * ```kotlin
-     * provide<FetchAddresses, List<Address>> { testAddresses }
-     * provide<FetchCachedToken, AuthToken> { null } // no cached token
+     * provide<List<Address>, FetchAddresses> { testAddresses }
+     * provide<AuthToken, FetchCachedToken> { null } // no cached token
      * ```
      *
      * @param I    the [DataImpulse] subclass.
@@ -59,7 +59,7 @@ class SynapseTestConfig {
      * or model streaming data sources.
      *
      * ```kotlin
-     * provideFlow<FetchProducts, List<Product>> { impulse ->
+     * provideFlow<List<Product>, FetchProducts> { impulse ->
      *     flow {
      *         emit(cachedProducts)
      *         delay(100)

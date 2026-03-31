@@ -29,7 +29,7 @@ class AuthCoordinatorTest {
 
     @get:Rule
     val synapse = SynapseTestRule {
-        provide<FetchCachedToken, AuthToken> { null } // no cached token
+        provide<AuthToken, FetchCachedToken> { null } // no cached token
     }
 
     private lateinit var coordinator: AuthCoordinator
@@ -60,7 +60,7 @@ class CheckoutScreenTest {
 
     @get:Rule
     val synapse = SynapseTestRule {
-        provide<FetchAddresses, List<Address>> { testAddresses }
+        provide<List<Address>, FetchAddresses> { testAddresses }
     }
 
     @get:Rule
@@ -99,8 +99,8 @@ val synapse = SynapseTestRule()
 // With providers
 @get:Rule
 val synapse = SynapseTestRule {
-    provide<FetchAddresses, List<Address>> { testAddresses }
-    provide<FetchCachedToken, AuthToken> { null }
+    provide<List<Address>, FetchAddresses> { testAddresses }
+    provide<AuthToken, FetchCachedToken> { null }
 }
 ```
 
@@ -203,13 +203,13 @@ Register providers in the `SynapseTestRule` constructor DSL:
 @get:Rule
 val synapse = SynapseTestRule {
     // Single-value provider
-    provide<FetchAddresses, List<Address>> { testAddresses }
+    provide<List<Address>, FetchAddresses> { testAddresses }
 
     // Provider that emits nothing (empty flow)
-    provide<FetchCachedToken, AuthToken> { null }
+    provide<AuthToken, FetchCachedToken> { null }
 
     // Multi-emission / streaming provider
-    provideFlow<FetchProducts, List<Product>> { impulse ->
+    provideFlow<List<Product>, FetchProducts> { impulse ->
         flow {
             emit(cachedProducts)
             delay(100)
