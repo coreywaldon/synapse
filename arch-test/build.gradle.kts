@@ -6,8 +6,8 @@ plugins {
     signing
 }
 
-group = "com.synapselib"
-version = "1.0.5"
+group = property("synapse.group") as String
+version = property("synapse.version") as String
 
 dependencies {
     api(project(":arch"))
