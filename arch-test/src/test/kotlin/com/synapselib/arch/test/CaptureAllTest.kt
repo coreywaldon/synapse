@@ -31,6 +31,17 @@ class CaptureAllImpulsesTest {
     }
 
     @Test
+    fun countReflectsNumberCaptured() = synapse.runTest {
+        val pings = synapse.onAllImpulses<Ping>()
+
+        assertEquals(0, pings.count)
+        synapse.Trigger(Ping("a"))
+        assertEquals(1, pings.count)
+        synapse.Trigger(Ping("b"))
+        assertEquals(2, pings.count)
+    }
+
+    @Test
     fun latestReturnsLast() = synapse.runTest {
         val pings = synapse.onAllImpulses<Ping>()
 

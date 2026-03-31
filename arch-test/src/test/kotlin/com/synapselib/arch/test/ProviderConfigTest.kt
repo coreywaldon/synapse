@@ -1,8 +1,12 @@
 package com.synapselib.arch.test
 
+import com.synapselib.arch.base.DataImpulse
+import kotlinx.coroutines.flow.flow
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+
+data class FetchMulti(val query: String) : DataImpulse<List<String>>()
 
 class ProviderConfigTest {
 
@@ -11,6 +15,12 @@ class ProviderConfigTest {
     @get:Rule
     val synapse = SynapseTestRule {
         provide<List<String>, FetchItems> { testItems }
+        provideFlow<List<String>, FetchMulti> {
+            flow {
+                emit(listOf("first"))
+                emit(listOf("first", "second"))
+            }
+        }
     }
 
     @Test
