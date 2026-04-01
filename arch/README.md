@@ -1,22 +1,959 @@
-# Synapse Arch Documentation
+# Synapse Arch
 
-## Overview
+![Maven Central](https://img.shields.io/maven-central/v/com.synapselib/arch)
+![Kotlin](https://img.shields.io/badge/kotlin-1.10.0-blue.svg?logo=kotlin)
+![License](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 
-**Synapse Arch** is a reactive, event-driven architecture for Kotlin/KMP/Android applications built on Kotlin Coroutines Flows. It provides a central message bus — the **SwitchBoard** — that coordinates three communication channels (**State**, **Reactions/Impulses**, and **Requests**) with a composable interceptor pipeline at every stage.
+**Architecture framework for Kotlin/Compose that eliminates the coordination problem.**
 
-It integrates with both **Jetpack Compose** (via the `Node`/`CreateContext` DSL) and **non-Compose** contexts (via `Coordinator`), and uses **KSP code generation** to wire data-fetching **Providers** automatically through Hilt or Koin.
+Every component in a Synapse application is an isolated state machine with typed inputs and outputs. Components never reference each other — they communicate exclusively through a central **SwitchBoard** that routes **state**, **reactions**, and **data requests** with a composable interceptor pipeline at every stage. The coupling between any two components is zero beyond the impulse types they share.
+
+This gives you a property most architectures can't: **compositional correctness**. If Component A works through the SwitchBoard and Component B works through the SwitchBoard, then A + B works — because the bus is real, never mocked, and the type system enforces the contract.
+
+There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL. **Non-Compose** contexts use `Coordinator`. Data fetching is handled by **Providers** wired automatically via KSP through Hilt or Koin.
 
 ---
 
-## Architecture Diagram
+## 📦 Installation
 
-### Primary Data Flow (Upstream → Channel → Downstream)
+```kotlin
+dependencies {
+    implementation("com.synapselib:arch:1.0.6")
+}
+```
 
-This diagram shows how data moves through the three channels, with interceptors applied at each stage.
+For KSP provider generation, also add:
+
+```kotlin
+plugins {
+    id("com.google.devtools.ksp")
+}
+```
+
+---
+
+## ⚡ Quick Start
+
+```kotlin
+@Composable
+fun ProductScreen(appServices: AppServices) {
+    CreateContext(appServices) {
+        Node(initialState = ScreenState()) {
+            // Fetch data — handler receives DataState<T> lifecycle updates
+            Request(impulse = FetchProducts(filter = "popular")) { dataState ->
+                update { it.copy(products = dataState) }
+            }
+
+            // Subscribe to global state (replay=1, gets latest immediately)
+            ListenFor<SessionState> { session ->
+                update { it.copy(session = session) }
+            }
+
+            // React to fire-and-forget events (no replay)
+            ReactTo<NavigateTo> { impulse ->
+                navController.navigate(impulse.route)
+            }
+
+            Scaffold {
+                when (val products = state.products) {
+                    is DataState.Loading -> CircularProgressIndicator()
+                    is DataState.Success -> ProductList(products.data)
+                    is DataState.Error -> ErrorMessage(products.cause)
+                    else -> {}
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## 🔀 Three Channels
+
+| Channel      | Replay | Produce            | Consume                     | Purpose                                                              |
+|--------------|--------|--------------------|-----------------------------|----------------------------------------------------------------------|
+| **State**    | 1      | `Broadcast(data)`  | `ListenFor<T> { ... }`     | Persistent state streams — new subscribers get the latest value      |
+| **Reaction** | 0      | `Trigger(event)`   | `ReactTo<A> { ... }`       | Fire-and-forget events — only active collectors receive them         |
+| **Request**  | 1      | `Request(impulse)` | `Request(impulse) { handler }` | Data fetching via Providers — full lifecycle (Loading/Success/Error) |
+
+---
+
+## 🧩 Core Types
+
+### `Impulse`
+
+Base class for fire-and-forget reaction events:
+
+```kotlin
+data class ShowToast(val message: String) : Impulse()
+data class NavigateTo(val route: String) : Impulse()
+object SessionExpired : Impulse()
+```
+
+Emitted via `Trigger()`, consumed via `ReactTo()`.
+
+### `DataImpulse<Need>`
+
+Base class for typed data requests. The generic `Need` declares the expected return type, enforced at compile time.
+
+**Must be a `data class`** — the provider system uses structural equality for job deduplication. Two `FetchProducts(id=1)` share one in-flight job.
+
+```kotlin
+data class FetchUserProfile(val userId: Int) : DataImpulse<UserProfile>()
+data class SearchProducts(val query: String, val page: Int) : DataImpulse<ProductPage>()
+```
+
+### `DataState<T>`
+
+Sealed interface wrapping the request lifecycle:
+
+| Variant              | Properties                          | Purpose                                                    |
+|----------------------|-------------------------------------|------------------------------------------------------------|
+| `DataState.Idle`     | —                                   | Initial state before any request                           |
+| `DataState.Loading`  | —                                   | Request is in-flight                                       |
+| `DataState.Success`  | `data: T`                           | Request completed successfully                             |
+| `DataState.Error`    | `cause: Throwable`, `staleData: T?` | Request failed — `staleData` holds last success for stale-while-revalidate UI |
+
+Extensions: `dataOrNull` extracts `Success.data` or returns `null`. `isLoading` returns `true` when in `Loading` state.
+
+### `SwitchBoard` (interface)
+
+The central contract. All cross-component communication flows through this interface. Callers rarely interact with it directly — `NodeScope` and `CoordinatorScope` provide typed wrappers.
+
+| Method                                                | Purpose                                                                       |
+|-------------------------------------------------------|-------------------------------------------------------------------------------|
+| `broadcastState(clazz, data)`                         | Emits a value into the state channel (upstream interceptors applied)          |
+| `triggerImpulse(clazz, data)`                         | Emits a fire-and-forget event into the reaction channel                       |
+| `handleRequest(impulseType, needType, impulse)`       | Routes a data request to the Provider system, returns `Flow<DataState<Need>>` |
+| `stateFlow(clazz)`                                    | Returns a downstream-intercepted `SharedFlow` for a state type (replay=1)     |
+| `impulseFlow(clazz)`                                  | Returns a downstream-intercepted `SharedFlow` for a reaction type (replay=0)  |
+| `getRawStateFlow(clazz)`                              | Returns the raw (unintercepted) state flow                                    |
+| `getRawImpulseFlow(clazz)`                            | Returns the raw (unintercepted) reaction flow                                 |
+| `addInterceptor(point, clazz, interceptor, priority)` | Registers an interceptor at a specific channel/direction point                |
+
+Reified extension functions are provided for all methods so callers rarely need to pass `KClass` tokens manually:
+
+```kotlin
+// Instead of:
+switchboard.broadcastState(UserProfile::class, profile)
+
+// Write:
+switchboard.broadcastState(profile)
+```
+
+### `DefaultSwitchBoard`
+
+The concrete `SwitchBoard` implementation. Injectable via Hilt (`@Inject constructor`).
+
+**Constructor parameters:**
+
+| Parameter                | Qualifier                      | Default          | Purpose                                                         |
+|--------------------------|--------------------------------|------------------|-----------------------------------------------------------------|
+| `scope`                  | `@SwitchBoardScope`            | —                | Parent `CoroutineScope` for `shareIn` and provider jobs         |
+| `providerRegistry`       | —                              | —                | Immutable impulse→factory mappings                              |
+| `workerContext`          | `@SwitchBoardWorkerContext`    | `Dispatchers.IO` | Coroutine context for provider execution                        |
+| `stopTimeoutMillis`      | `@SwitchBoardStopTimeout`      | 3000ms           | `WhileSubscribed` stop timeout for downstream shared flows      |
+| `replayExpirationMillis` | `@SwitchBoardReplayExpiration` | 3000ms           | `WhileSubscribed` replay expiration for downstream shared flows |
+
+Call `setEagerSharing()` before any flow is consumed to switch from lazy `WhileSubscribed` to `SharingStarted.Eagerly` — intended for testing.
+
+### `LocalSwitchBoard`
+
+Compose `CompositionLocal` that provides the current `SwitchBoard` to the composition tree. Throws `IllegalStateException` if accessed without a provider.
+
+```kotlin
+// Providing (typically in MainActivity or Application)
+CompositionLocalProvider(LocalSwitchBoard provides mySwitchBoard) {
+    MyApp()
+}
+```
+
+---
+
+## 🖼️ Compose DSL
+
+### `CreateContext`
+
+Establishes a context boundary pairing an arbitrary value with the nearest `SwitchBoard`:
+
+```kotlin
+CreateContext(appServices) {
+    // `this` is ContextScope<AppServices>
+    Node(initialState = UiState()) {
+        // `this` is NodeScope<AppServices, UiState>
+    }
+}
+```
+
+Optional `tag` parameter enables [tracing](#-observability):
+
+```kotlin
+CreateContext(appServices, tag = "CheckoutScreen") { ... }
+```
+
+**Nested contexts** — use `CreateContext` inside a Node to change the context type for child components:
+
+```kotlin
+CreateContext(appServices) {
+    Node(initialState = HomeState()) {
+        Request(impulse = FetchProducts(filter)) { dataState ->
+            update { it.copy(products = dataState) }
+        }
+
+        state.products.dataOrNull?.forEach { product ->
+            // Switch context to Product — child composables get typed access
+            CreateContext(product) {
+                ProductCard()
+            }
+        }
+    }
+}
+```
+
+### `Node` & `NodeScope`
+
+Creates a stateful node inside a `ContextScope`. The fundamental unit of the Compose DSL.
+
+**NodeScope capabilities:**
+
+| Category              | Method                                    | Composable? |
+|-----------------------|-------------------------------------------|-------------|
+| **Local state**       | `update { reducer }`                      | No          |
+| **State broadcast**   | `Broadcast(data)`                         | No (suspend)|
+| **Reactions**         | `Trigger(event)`                          | No (suspend)|
+| **Interception**      | `Intercept(point, interceptor, priority)` | No          |
+| **Request**           | `Request(impulse, key) { handler }`       | Yes         |
+| **Listen (state)**    | `ListenFor(stateKey) { handler }`         | Yes         |
+| **Listen (reaction)** | `ReactTo(reactionKey) { handler }`        | Yes         |
+
+**Properties:**
+
+| Property  | Type             | Purpose                                                            |
+|-----------|------------------|--------------------------------------------------------------------|
+| `context` | `C`              | Read-only access to the value from `CreateContext`                 |
+| `state`   | `S`              | Current snapshot of local state (triggers recomposition on change) |
+| `scope`   | `CoroutineScope` | For launching coroutines (e.g., to `Trigger` from click handlers) |
+
+**ContextScope extensions** — the standard pattern for child composables. Declaring a composable as a `ContextScope<T>` extension gives it access to `context`, `scope`, `Trigger`, `Broadcast`, and `update` without prop drilling:
+
+```kotlin
+// Child composable — extension on ContextScope gives bus access
+@Composable
+fun ContextScope<Product>.ProductCard() {
+    val product = context  // typed access to the Product from CreateContext
+    Card(
+        modifier = Modifier.clickable {
+            scope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }
+        }
+    ) {
+        Text(product.name)
+        Text(product.formattedPrice)
+    }
+}
+```
+
+`Trigger` and `Broadcast` are suspend functions. Use `scope.launch { }` from non-suspend contexts like click handlers.
+
+**Lifecycle-aware subscriptions** (`ListenFor`, `ReactTo`, `Request`) use `DisposableEffect` internally — canceled and relaunched when their key changes, canceled when the composable exits.
+
+**State persistence**: If `S` has a `@Serializable` annotation (kotlinx.serialization), state is automatically saved/restored across configuration changes via `rememberSaveable`.
+
+```kotlin
+Node(initialState = ScreenState()) {
+    Text("Count: ${state.count}")
+
+    Button(onClick = { update { it.copy(count = it.count + 1) } }) {
+        Text("Increment")
+    }
+
+    ListenFor<ThemeSettings> { settings ->
+        update { it.copy(darkMode = settings.darkMode) }
+    }
+
+    ReactTo<NavigateTo> { event ->
+        navController.navigate(event.route)
+    }
+
+    Request(impulse = FetchUserProfile(userId = 42)) { dataState ->
+        update { it.copy(profileState = dataState) }
+    }
+}
+```
+
+---
+
+## 🎛️ Coordinator (Non-Compose)
+
+For business logic outside Compose — activities, services, background processes.
+
+### Creating a Coordinator
+
+```kotlin
+val coordinator = Coordinator(switchboard, lifecycleOwner) {
+    ListenFor<AppConfig> { config ->
+        applyConfig(config)
+    }
+
+    ReactTo<SessionExpired> {
+        launch { Trigger(NavigateToLogin) }
+    }
+
+    Intercept<AnalyticsEvent>(
+        point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+        interceptor = Interceptor.read { event -> analytics.track(event) },
+    )
+}
+```
+
+Auto-disposes on `ON_DESTROY`. Call `coordinator.dispose()` for earlier cleanup (idempotent).
+
+Optional `tag` parameter enables [tracing](#-observability):
+
+```kotlin
+val coordinator = Coordinator(switchboard, lifecycleOwner, tag = "AuthCoordinator") { ... }
+```
+
+### Flow vs Handler overloads
+
+Every consumption method has two overloads:
+
+| Category              | Flow overload → returns                        | Handler overload → returns |
+|-----------------------|------------------------------------------------|----------------------------|
+| **Listen (state)**    | `ListenFor<O>()` → `SharedFlow<O>`            | `ListenFor<O> { ... }` → `Job` |
+| **Listen (reaction)** | `ReactTo<A>()` → `SharedFlow<A>`              | `ReactTo<A> { ... }` → `Job` |
+| **Request**           | `Request<Need, I>(impulse)` → `Flow<DataState<Need>>` | `Request<Need, I>(impulse) { handler }` → `Job` |
+
+Flow overloads are useful for composition:
+
+```kotlin
+Coordinator(switchboard, lifecycleOwner) {
+    val configFlow = ListenFor<AppConfig>()
+    val flagsFlow = ListenFor<FeatureFlags>()
+
+    launch {
+        combine(configFlow, flagsFlow) { config, flags ->
+            resolveSettings(config, flags)
+        }.collectLatest { settings ->
+            Broadcast(settings)
+        }
+    }
+}
+```
+
+Handler overloads run with `CoordinatorScope` as the receiver, giving direct access to `Broadcast`, `Trigger`, `launch`, etc.
+
+---
+
+## 🔗 Interceptors
+
+Composable middleware (similar to OkHttp interceptors) registered at any of 6 intercept points.
+
+### Factory methods
+
+| Factory                                          | Behavior                                          |
+|--------------------------------------------------|---------------------------------------------------|
+| `Interceptor.read { data -> ... }`               | Observe only — always proceeds with original data |
+| `Interceptor.transform { data -> modifiedData }` | Maps data before proceeding                       |
+| `Interceptor.full { data, proceed -> ... }`      | Full control: retry, skip, wrap, short-circuit    |
+
+```kotlin
+// Logging (read-only)
+Interceptor.read<UserProfile> { profile ->
+    logger.info("Profile loaded: ${profile.name}")
+}
+
+// Add auth token (transform)
+Interceptor.transform<NetworkRequest> { request ->
+    request.copy(token = authManager.currentToken)
+}
+
+// Retry on failure (full control)
+Interceptor.full<ApiCall> { call, proceed ->
+    try {
+        proceed(call)
+    } catch (e: Exception) {
+        proceed(call.copy(retryCount = call.retryCount + 1))
+    }
+}
+```
+
+### Intercept points
+
+| Point                    | Meaning                                                |
+|--------------------------|--------------------------------------------------------|
+| `(STATE, UPSTREAM)`      | Before a state broadcast is emitted to the flow        |
+| `(STATE, DOWNSTREAM)`    | Before a collected state value is delivered to listener |
+| `(REACTION, UPSTREAM)`   | Before a reaction event is emitted to the flow         |
+| `(REACTION, DOWNSTREAM)` | Before a collected reaction is delivered to listener    |
+| `(REQUEST, UPSTREAM)`    | Before request params reach the ProviderManager        |
+| `(REQUEST, DOWNSTREAM)`  | After the provider produces a result, before emission   |
+
+### Priorities
+
+Interceptors execute in ascending priority order (lowest value first). Ties are broken by insertion order (FIFO).
+
+```kotlin
+// Runs first (lowest priority)
+Intercept<TokenBearer>(
+    point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+    interceptor = Interceptor.transform { it.apply { token = currentToken } },
+    priority = 0,
+)
+
+// Runs last (highest priority)
+Intercept<TokenBearer>(
+    point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+    interceptor = Interceptor.read { log(it) },
+    priority = Int.MAX_VALUE,
+)
+```
+
+### `Registration`
+
+`addInterceptor` returns a `Registration` handle. Call `unregister()` to remove. Idempotent — safe to call multiple times.
+
+---
+
+## 📡 Provider System
+
+Providers handle `DataImpulse` requests — the data-fetching backbone of Synapse.
+
+### Defining a Provider
+
+```kotlin
+@SynapseProvider
+class FetchProductsProvider @Inject constructor(
+    private val api: MarketApi,
+) : Provider<FetchProducts, List<Product>>() {
+    override fun ProviderScope.produce(impulse: FetchProducts): Flow<List<Product>> = flow {
+        emit(api.getProducts(impulse.filter))
+    }
+}
+```
+
+Requirements:
+- Concrete (non-abstract) class annotated with `@SynapseProvider`
+- Directly extends `Provider<I, Need>` with concrete type arguments
+- `@Inject` constructor (Hilt) or Koin-resolvable
+- `DataImpulse` type must be a `data class`
+- One provider per `DataImpulse` type — KSP enforces this at compile time
+
+### ProviderScope
+
+Providers execute inside a `ProviderScope` with full SwitchBoard access:
+
+| Method                      | Purpose                                      |
+|-----------------------------|----------------------------------------------|
+| `ListenFor<O>()`            | Returns `SharedFlow<O>` from state channel   |
+| `ReactTo<A>()`              | Returns `SharedFlow<A>` from reaction channel|
+| `Broadcast(data)`           | Emits state into the SwitchBoard             |
+| `Trigger(event)`            | Fires a reaction impulse                     |
+| `Request<Need, I>(impulse)` | Issues a nested data request                 |
+
+ProviderScope provides **flow overloads only** — no handler overloads. Use `.collect`, `.first()`, etc. to consume flows.
+
+```kotlin
+// Provider that reads auth state
+@SynapseProvider
+class FetchSecureDataProvider @Inject constructor(
+    private val api: SecureApi,
+) : Provider<FetchSecureData, SecurePayload>() {
+    override fun ProviderScope.produce(impulse: FetchSecureData) = flow {
+        val token = ListenFor<AuthToken>().first()
+        emit(api.fetch(impulse.endpoint, token))
+    }
+}
+
+// Streaming / observation provider
+@SynapseProvider
+class WatchCartProvider @Inject constructor(
+    private val cartDao: CartDao,
+) : Provider<WatchCart, Cart>() {
+    override fun ProviderScope.produce(impulse: WatchCart): Flow<Cart> =
+        cartDao.observeCart(impulse.cartId)
+}
+```
+
+### Job deduplication
+
+Active requests are keyed by `DataImpulse` structural equality. Two `FetchProducts(id=1)` impulses share the same in-flight job and `DataState` flow. Two `FetchProducts(id=1)` and `FetchProducts(id=2)` run concurrently.
+
+### ProviderRegistry
+
+Immutable map of `DataImpulse` type to `ProviderFactory`. Built via `Builder`:
+
+```kotlin
+val registry = ProviderRegistry.Builder()
+    .register<UserProfile, FetchUserProfile> { FetchUserProfileProvider(api) }
+    .register<ProductPage, SearchProducts> { SearchProductsProvider(api) }
+    .build()
+```
+
+Multi-module composition:
+
+```kotlin
+val registry = ProviderRegistry.Builder()
+    .mergeFrom(featureARegistry)
+    .mergeFrom(featureBRegistry)
+    .build()
+```
+
+`ProviderRegistry.EMPTY` is available for tests.
+
+### KSP Code Generation
+
+#### Hilt
+
+KSP generates `SynapseProviderModule_{ModuleName}` per Gradle module:
+
+```kotlin
+@Module
+@InstallIn(SingletonComponent::class)
+object SynapseProviderModule_App {
+    @Provides @Singleton
+    fun provideRegistry(
+        fetchUserProfileProvider: javax.inject.Provider<FetchUserProfileProvider>,
+        searchProductsProvider: javax.inject.Provider<SearchProductsProvider>,
+    ): ProviderRegistry {
+        return ProviderRegistry.Builder()
+            .register(
+                impulseType = FetchUserProfile::class,
+                needClass = UserProfile::class.java,
+                factory = ProviderFactory { fetchUserProfileProvider.get() },
+            )
+            .register(
+                impulseType = SearchProducts::class,
+                needClass = ProductPage::class.java,
+                factory = ProviderFactory { searchProductsProvider.get() },
+            )
+            .build()
+    }
+}
+```
+
+Testing override:
+
+```kotlin
+@UninstallModules(SynapseProviderModule_App::class)
+@HiltAndroidTest
+class MyTest {
+    @BindValue
+    val registry = ProviderRegistry.Builder()
+        .register<UserProfile, FetchUserProfile> { FakeProvider() }
+        .build()
+}
+```
+
+#### Koin
+
+KSP generates `synapseProviderModule_{ModuleName}`:
+
+```kotlin
+val synapseProviderModule_app = module {
+    factory { get<FetchUserProfileProvider>() }
+    factory { get<SearchProductsProvider>() }
+
+    single<ProviderRegistry> {
+        ProviderRegistry.Builder()
+            .register(
+                impulseType = FetchUserProfile::class,
+                needClass = UserProfile::class.java,
+                factory = ProviderFactory { get<FetchUserProfileProvider>() },
+            )
+            .build()
+    }
+}
+```
+
+Usage:
+
+```kotlin
+startKoin {
+    modules(synapseProviderModule_app)
+}
+```
+
+---
+
+## 🔍 Observability
+
+### Global Logger
+
+Register a read-only logger that fires for **all** data passing through the SwitchBoard, regardless of type, channel, or direction:
+
+```kotlin
+switchBoard.setGlobalLogger { point, clazz, data ->
+    Log.d("SwitchBoard", "[$point] ${clazz.simpleName}: $data")
+}
+```
+
+Pass `null` to remove. Signature: `(InterceptPoint, KClass<*>, Any) -> Unit`.
+
+For type-specific logging, use `addLoggingInterceptors<T>` which registers read-only interceptors at all 6 intercept points:
+
+```kotlin
+switchBoard.addLoggingInterceptors<UserProfile> { profile ->
+    analytics.track("profile_event", profile.userId)
+}
+```
+
+### TraceContext (opt-in origin tracing)
+
+When a `Coordinator` or `CreateContext` is given a `tag`, every `Trigger` and `Broadcast` call automatically attaches a `TraceContext` to the coroutine context. The SwitchBoard reads this in `processAndLog` and invokes the trace listener.
+
+```kotlin
+// Tag your components
+val coordinator = Coordinator(switchboard, owner, tag = "AuthCoordinator") { ... }
+
+CreateContext(appServices, tag = "CheckoutScreen") { ... }
+
+// Listen for traces
+switchBoard.setTraceListener { trace, point, clazz, data ->
+    Log.d("Trace", "[${trace.emitterTag}] $point ${clazz.simpleName}: $data")
+}
+```
+
+`TraceContext` is a `CoroutineContext.Element` — it never enters the `SharedFlow`. Interceptors and consumers still see raw `T`. When `tag` is `null` (the default), no `TraceContext` is created and zero overhead is incurred.
+
+**TraceContext fields:**
+
+| Field           | Type      | Default                       | Purpose                          |
+|-----------------|-----------|-------------------------------|----------------------------------|
+| `traceId`       | `String`  | `UUID.randomUUID().toString()`| Unique identifier for this trace |
+| `parentTraceId` | `String?` | `null`                        | Link to a parent trace           |
+| `emitterTag`    | `String?` | `null`                        | Human-readable emitter label     |
+| `timestamp`     | `Long`    | `System.nanoTime()`           | Monotonic creation timestamp     |
+
+---
+
+## 📘 Tutorial & Best Practices
+
+### Screen pattern
+
+A typical screen follows the `CreateContext → Node → UI` pattern. The `CreateContext` provides shared services; the `Node` holds screen-local state; the composable body renders UI.
+
+```kotlin
+// 1. Define screen state
+@Serializable
+data class CheckoutState(
+    val addresses: DataState<List<Address>> = DataState.Idle,
+    val selectedAddress: Address? = null,
+    val isSubmitting: Boolean = false,
+)
+
+// 2. Define impulses for cross-component communication (not local state changes)
+object Checkout {
+    data class Submit(val addressId: String) : Impulse()
+}
+
+// 3. Build the screen
+@Composable
+fun CheckoutScreen(appServices: AppServices) {
+    CreateContext(appServices, tag = "CheckoutScreen") {
+        Node(initialState = CheckoutState()) {
+            // Data loading
+            Request(impulse = FetchAddresses()) { dataState ->
+                update { it.copy(addresses = dataState) }
+            }
+
+            // React to submit (fired by child composable via Trigger)
+            ReactTo<Checkout.Submit> {
+                update { it.copy(isSubmitting = true) }
+            }
+
+            // Global state subscription
+            ListenFor<SessionState> { session ->
+                if (session is SessionState.LoggedOut) {
+                    scope.launch { Trigger(NavigateTo("login")) }
+                }
+            }
+
+            // UI — no callbacks passed down
+            CheckoutContent(state = state)
+        }
+    }
+}
+
+// Child composable as a ContextScope extension — gives bus access without prop drilling
+@Composable
+fun ContextScope<AppServices>.CheckoutContent(state: CheckoutState) {
+    // Local state change — use update directly, no impulse needed
+    AddressList(
+        addresses = state.addresses.dataOrNull.orEmpty(),
+        selected = state.selectedAddress,
+        onSelect = { addr -> update { it.copy(selectedAddress = addr) } },
+    )
+
+    Button(
+        // Cross-component action — fire an impulse
+        onClick = {
+            scope.launch { Trigger(Checkout.Submit(state.selectedAddress!!.id)) }
+        },
+        enabled = state.selectedAddress != null && !state.isSubmitting,
+    ) {
+        Text(if (state.isSubmitting) "Submitting..." else "Place Order")
+    }
+}
+```
+
+**No callback threading.** Child composables should never receive `onSomething` lambdas that thread state changes back up to a parent Node. Instead, children fire impulses through the bus via `Trigger()`, and the Node reacts to them with `ReactTo`. This keeps components decoupled — they communicate through typed impulses, not callback chains.
+
+Passing **read-only display data** as parameters is fine — the anti-pattern is passing **callback lambdas** that modify parent state.
+
+```kotlin
+// Anti-pattern: callback threading
+CheckoutContent(
+    onSubmit = { scope.launch { Trigger(Checkout.Submit(id)) } },  // ❌
+)
+
+// Correct: pass read-only data, child fires impulses directly
+ProductCard(isFavorited = true, quantityInCart = 3)  // ✅ read-only data as params
+scope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }  // ✅ child fires impulse
+```
+
+**Use impulses for cross-component communication.** Use `update` directly for screen-local state changes (e.g., selecting an address, toggling a filter). Only create an impulse when the action needs to cross component boundaries.
+
+### Coordinator patterns
+
+Coordinators handle business logic that spans multiple screens or lives beyond a single composition. Use them for:
+
+- **Cross-cutting concerns**: Auth token injection, session management, analytics
+- **Background work**: Sync jobs, push notification handling
+- **Multi-screen orchestration**: Cart management, onboarding flows
+
+```kotlin
+// Auth coordinator — injected token into all outgoing TokenBearer impulses
+class AuthCoordinator(
+    private val authApi: AuthApi,
+    private val owner: LifecycleOwner,
+) {
+    private lateinit var scope: CoordinatorScope
+
+    fun initialize(switchboard: SwitchBoard) {
+        scope = Coordinator(switchboard, owner, tag = "AuthCoordinator") {
+            // Inject auth token into all outgoing requests
+            Intercept<TokenBearer>(
+                point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+                interceptor = Interceptor.transform { impulse ->
+                    impulse.apply { token = currentToken }
+                },
+            )
+
+            // Handle login
+            ReactTo<LoginRequested> { request ->
+                launch {
+                    val result = authApi.login(request.email, request.password)
+                    Broadcast(SessionState.Authenticated(result.user))
+                    Trigger(NavigateTo("home"))
+                }
+            }
+
+            // Handle logout
+            ReactTo<LogoutRequested> {
+                launch {
+                    authApi.logout()
+                    Broadcast(SessionState.LoggedOut)
+                    Trigger(NavigateTo("login"))
+                }
+            }
+        }
+    }
+}
+```
+
+**Prefer multiple focused coordinators** over a single large one. Each coordinator is a state machine with typed inputs and outputs. The coupling between them is extraordinarily low — only the impulse types form the contract.
+
+```kotlin
+// Good: separate concerns
+class AuthCoordinator(...)      // handles auth flow
+class CartCoordinator(...)      // handles cart operations
+class AnalyticsCoordinator(...) // handles event tracking
+
+// Bad: god coordinator
+class AppCoordinator(...)       // handles everything
+```
+
+### Impulse organization
+
+Use parent objects to namespace impulses and avoid naming collisions:
+
+```kotlin
+// Domain-scoped impulses
+object Cart {
+    data class AddItem(val productId: String, val qty: Int) : Impulse()
+    data class RemoveItem(val productId: String) : Impulse()
+    data class Clear(val cartId: String) : Impulse()
+}
+
+object Auth {
+    data class Login(val email: String, val password: String) : Impulse()
+    object Logout : Impulse()
+    data class TokenRefreshed(val token: String) : Impulse()
+}
+
+// Data impulses follow the same pattern
+object Fetch {
+    data class Products(val filter: String) : DataImpulse<List<Product>>()
+    data class UserProfile(val userId: Int) : DataImpulse<User>()
+    data class Addresses(val userId: Int) : DataImpulse<List<Address>>()
+}
+```
+
+### State design
+
+Keep screen state flat and focused. Use `DataState<T>` for anything loaded from a provider. Use `@Serializable` to survive configuration changes.
+
+```kotlin
+@Serializable
+data class ProductListState(
+    val products: DataState<List<Product>> = DataState.Idle,
+    val searchQuery: String = "",
+    val selectedCategory: Category? = null,
+    val isRefreshing: Boolean = false,
+)
+```
+
+**Avoid storing derived state.** Compute it in the composable body:
+
+```kotlin
+Node(initialState = ProductListState()) {
+    // Derived — computed on each recomposition, not stored
+    val filteredProducts = state.products.dataOrNull
+        ?.filter { it.category == state.selectedCategory }
+        ?: emptyList()
+
+    ProductList(filteredProducts)
+}
+```
+
+### Interceptor patterns
+
+**Auth token injection** — a single interceptor handles tokens for all outgoing requests:
+
+```kotlin
+Intercept<TokenBearer>(
+    point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+    interceptor = Interceptor.transform { impulse ->
+        impulse.apply { token = tokenManager.current() }
+    },
+)
+```
+
+**Request logging** — observe all requests without modifying them:
+
+```kotlin
+Intercept<Any>(
+    point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
+    interceptor = Interceptor.read { data ->
+        logger.debug("Request: ${data::class.simpleName} → $data")
+    },
+    priority = Int.MIN_VALUE, // runs first
+)
+```
+
+**Retry logic** — wrap a specific request type with retry:
+
+```kotlin
+Intercept<NetworkCall>(
+    point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
+    interceptor = Interceptor.full { call, proceed ->
+        var lastError: Throwable? = null
+        repeat(3) {
+            try { return@full proceed(call) }
+            catch (e: IOException) { lastError = e; delay(1000L * (it + 1)) }
+        }
+        throw lastError!!
+    },
+)
+```
+
+### Provider patterns
+
+**One-shot fetch** — the most common pattern:
+
+```kotlin
+@SynapseProvider
+class FetchProductsProvider @Inject constructor(
+    private val api: MarketApi,
+) : Provider<Fetch.Products, List<Product>>() {
+    override fun ProviderScope.produce(impulse: Fetch.Products) = flow {
+        emit(api.getProducts(impulse.filter))
+    }
+}
+```
+
+**Observe pattern** — return an observing Flow from the data source. This eliminates the need for cache invalidation — the flow emits whenever the underlying data changes:
+
+```kotlin
+@SynapseProvider
+class WatchCartProvider @Inject constructor(
+    private val cartDao: CartDao,
+) : Provider<WatchCart, Cart>() {
+    override fun ProviderScope.produce(impulse: WatchCart): Flow<Cart> =
+        cartDao.observeCart(impulse.cartId) // Room DAO returns Flow
+}
+```
+
+**Nested requests** — providers can issue their own requests:
+
+```kotlin
+@SynapseProvider
+class FetchOrderDetailsProvider @Inject constructor(
+    private val api: OrderApi,
+) : Provider<FetchOrderDetails, OrderDetails>() {
+    override fun ProviderScope.produce(impulse: FetchOrderDetails) = flow {
+        val order = api.getOrder(impulse.orderId)
+        // Nested request for shipping info
+        val shipping = Request<ShippingInfo, FetchShipping>(
+            FetchShipping(order.trackingId)
+        ).first { it is DataState.Success }.data
+        emit(OrderDetails(order, shipping))
+    }
+}
+```
+
+### Scaling to large applications
+
+Synapse scales through **composition, not hierarchy**. Each component is an isolated state machine with typed inputs (impulses it reacts to) and outputs (impulses it triggers, state it broadcasts). The SwitchBoard is the only shared surface.
+
+**Compositional testing guarantee**: If Component A works and Component B works through the real SwitchBoard, then A + B works — because the bus is never mocked and impulse types are the only contract.
+
+**Multi-module structure:**
+
+```
+feature-auth/
+├── coordinators/AuthCoordinator.kt
+├── providers/FetchTokenProvider.kt
+├── impulse/Auth.kt          # Auth.Login, Auth.Logout, etc.
+├── state/SessionState.kt
+└── ui/screens/LoginScreen.kt
+
+feature-checkout/
+├── coordinators/CheckoutCoordinator.kt
+├── providers/FetchAddressesProvider.kt
+├── impulse/Checkout.kt       # Checkout.Submit, etc.
+├── state/CheckoutState.kt
+└── ui/screens/CheckoutScreen.kt
+
+app/
+├── di/                        # Hilt modules: SwitchBoardModule, CoordinatorModule
+├── MainApplication.kt         # Initialize coordinators
+└── MainActivity.kt            # CompositionLocalProvider + navigation
+```
+
+Each feature module defines its own impulses, state types, coordinators, and providers. Cross-feature communication happens purely through impulse types and state broadcasts — no direct dependencies between features.
+
+---
+
+## 🏗️ Architecture Diagrams
+
+### Primary Data Flow
 
 ```mermaid
 flowchart LR
-    subgraph Producers ["Producers (Upstream Entry Points)"]
+    subgraph Producers ["Producers (Upstream)"]
         BS["Broadcast(data)"]
         TI["Trigger(event)"]
         RQ["Request(impulse)"]
@@ -24,29 +961,29 @@ flowchart LR
 
     subgraph UP ["Upstream Interceptors"]
         direction TB
-        UP_S["STATE × UPSTREAM<br/>(InterceptorRegistry)"]
-        UP_R["REACTION × UPSTREAM<br/>(InterceptorRegistry)"]
-        UP_Q["REQUEST × UPSTREAM<br/>(InterceptorRegistry)"]
+        UP_S["STATE × UPSTREAM"]
+        UP_R["REACTION × UPSTREAM"]
+        UP_Q["REQUEST × UPSTREAM"]
     end
 
     subgraph Channels ["Channel Storage"]
         direction TB
-        SF["State MutableSharedFlow<br/>(replay=1, DROP_OLDEST)"]
-        RF["Reaction MutableSharedFlow<br/>(replay=0, buffer=64)"]
-        PM["ProviderManager<br/>(dedup, concurrency,<br/>SupervisorJob isolation)"]
+        SF["State SharedFlow<br/>(replay=1)"]
+        RF["Reaction SharedFlow<br/>(replay=0)"]
+        PM["ProviderManager"]
     end
 
     subgraph DN ["Downstream Interceptors"]
         direction TB
-        DN_S["STATE × DOWNSTREAM<br/>(InterceptorRegistry)"]
-        DN_R["REACTION × DOWNSTREAM<br/>(InterceptorRegistry)"]
-        DN_Q["REQUEST × DOWNSTREAM<br/>(InterceptorRegistry)"]
+        DN_S["STATE × DOWNSTREAM"]
+        DN_R["REACTION × DOWNSTREAM"]
+        DN_Q["REQUEST × DOWNSTREAM"]
     end
 
-    subgraph Consumers ["Consumers (Downstream Exit Points)"]
-        LF["ListenFor‹T›()<br/>→ SharedFlow‹T›"]
-        RT["ReactTo‹A›()<br/>→ SharedFlow‹A›"]
-        DS["Request result<br/>→ Flow‹DataState‹Need››"]
+    subgraph Consumers ["Consumers (Downstream)"]
+        LF["ListenFor‹T›"]
+        RT["ReactTo‹A›"]
+        DS["Flow‹DataState‹Need››"]
     end
 
     BS --> UP_S --> SF --> DN_S --> LF
@@ -56,68 +993,108 @@ flowchart LR
 
 ### Consumer & Producer Layers
 
-This diagram shows which components can produce and consume, and how they connect to the SwitchBoard.
-
 ```mermaid
 flowchart TB
     subgraph Compose ["Compose UI Layer"]
-        CC["CreateContext‹T›<br/>(context boundary, no ViewModel)"]
-        CC --> CS["ContextScope‹T›"]
+        CC["CreateContext‹T›"] --> CS["ContextScope‹T›"]
         CS --> N["Node‹C, S›"]
-        N --> NS["NodeScope‹C, S›<br/>• local state (update)<br/>• Broadcast / Trigger<br/>• ListenFor / ReactTo<br/>• Request / Intercept"]
+        N --> NS["NodeScope‹C, S›<br/>• update / Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept"]
     end
 
     subgraph NonCompose ["Non-Compose Layer"]
-        CO["Coordinator()"] --> COS["CoordinatorScope<br/>• flow + handler overloads<br/>• Broadcast / Trigger<br/>• ListenFor / ReactTo<br/>• Request / Intercept<br/>• manual dispose()"]
+        CO["Coordinator()"] --> COS["CoordinatorScope<br/>• flow + handler overloads<br/>• Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept / dispose()"]
     end
 
-    subgraph SB ["DefaultSwitchBoard"]
-        direction LR
-        BUS["SwitchBoard Interface<br/>(broadcastState / triggerImpulse / handleRequest<br/>stateFlow / impulseFlow / addInterceptor)"]
+    subgraph SB ["SwitchBoard"]
+        BUS["broadcastState / triggerImpulse / handleRequest<br/>stateFlow / impulseFlow / addInterceptor"]
     end
 
-    NS -->|"upstream:<br/>Broadcast / Trigger / Request"| BUS
-    BUS -->|"downstream:<br/>ListenFor / ReactTo / Request result"| NS
-
-    COS -->|"upstream:<br/>Broadcast / Trigger / Request"| BUS
-    BUS -->|"downstream:<br/>ListenFor / ReactTo / Request result"| COS
+    NS -->|"upstream"| BUS
+    BUS -->|"downstream"| NS
+    COS -->|"upstream"| BUS
+    BUS -->|"downstream"| COS
 
     subgraph Providers ["Provider System"]
-        PM2["ProviderManager"]
-        PR2["ProviderRegistry<br/>(immutable impulse→factory map)"]
-        PF2["ProviderFactory → Provider"]
-        PS2["ProviderScope<br/>(full SwitchBoard access)"]
-
-        PM2 --> PR2 --> PF2
-        PF2 --> PS2
+        PM2["ProviderManager"] --> PR2["ProviderRegistry"]
+        PR2 --> PF2["ProviderFactory → Provider"]
+        PF2 --> PS2["ProviderScope"]
     end
 
-    BUS -->|"handleRequest(impulse)"| PM2
-    PM2 -->|"Flow‹DataState‹Need››"| BUS
-    PS2 -->|"upstream:<br/>Broadcast / Trigger / Request (nested)"| BUS
-    BUS -->|"downstream:<br/>ListenFor / ReactTo"| PS2
+    BUS -->|"handleRequest"| PM2
+    PM2 -->|"DataState‹Need›"| BUS
+    PS2 -->|"upstream"| BUS
+```
 
-    subgraph TypeAdapters ["Type-Safe Flow Adapters"]
-        TA["TypedSharedFlow‹T›<br/>TypedStateFlow‹T›<br/>TypedDataSharedFlow‹T›<br/>TypedDataStateFlow‹T›<br/>(Class.cast per element)"]
+### State Broadcast & Consumption
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant UP as Upstream Interceptors
+    participant SF as SharedFlow (replay=1)
+    participant DN as Downstream Interceptors
+    participant C as Consumer
+
+    P->>UP: Broadcast(data)
+    UP->>SF: intercepted data
+    Note over SF: Stores latest value
+    C->>SF: ListenFor<T>()
+    SF->>DN: raw value
+    DN->>C: intercepted value
+    Note over C: New subscribers get latest immediately
+```
+
+### Reaction (Impulse) Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant UP as Upstream Interceptors
+    participant RF as SharedFlow (replay=0)
+    participant DN as Downstream Interceptors
+    participant C as Consumer
+
+    P->>UP: Trigger(event)
+    UP->>RF: intercepted event
+    Note over RF: No replay
+    RF->>DN: raw event
+    DN->>C: intercepted event via ReactTo
+    Note over C: Missed if not actively collecting
+```
+
+### Request Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant UP as Upstream Interceptors
+    participant SB as SwitchBoard
+    participant PM as ProviderManager
+    participant PR as Provider
+    participant DN as Downstream Interceptors
+
+    C->>UP: Request(impulse)
+    UP->>SB: intercepted impulse
+    SB->>PM: handleRequest(impulse)
+
+    alt Identical impulse already active
+        PM-->>SB: existing SharedFlow (dedup)
+    else New request
+        PM->>PR: Create Provider + ProviderScope
+        PM-->>SB: DataState.Loading
+        PR-->>PM: emit value(s)
+        PM-->>SB: DataState.Success(value)
+        Note over PM: On exception
+        PM-->>SB: DataState.Error(cause, lastSuccess)
     end
 
-    BUS -->|"wraps raw flows"| TA
-    TA -->|"typed flows to consumers"| NS
-    TA -->|"typed flows to consumers"| COS
-
-    subgraph KSP ["KSP Code Generation (compile-time)"]
-        SPA["@SynapseProvider"] --> PP["ProviderProcessor"]
-        PP -->|"Hilt: SynapseProviderModule_*<br/>Koin: synapseProviderModule_*"| PR2
-    end
-
-    LSB["LocalSwitchBoard<br/>(CompositionLocal)"]
-    BUS -.->|"provided via"| LSB
-    LSB -.->|"injected into"| CC
+    SB->>DN: DataState result
+    DN->>C: Flow<DataState<T>>
 ```
 
 ### Request Channel Detail (Provider Lifecycle)
 
-This diagram zooms into the Request channel to show dedup, concurrency gating, and the DataState lifecycle.
+Zooms into the Request channel to show dedup, concurrency gating, and the `DataState` lifecycle.
 
 ```mermaid
 flowchart TD
@@ -147,938 +1124,46 @@ flowchart TD
     EXISTING --> DN_REQ["REQUEST × DOWNSTREAM<br/>Interceptors"]
     CLEANUP --> DN_REQ
     ERR --> DN_REQ
-    DN_REQ --> RESULT["→ Flow‹DataState‹Need›› to caller<br/>(via TypedDataSharedFlow)"]
+    DN_REQ --> RESULT["→ Flow‹DataState‹Need›› to caller"]
 ```
 
----
+### Interceptor Pipeline
 
-## Component Reference
-
-### Core Bus
-
-#### `SwitchBoard` (interface)
-**Package:** `com.synapselib.arch.base`
-
-The central contract defining three communication channels (State, Reaction, Request), typed flow access, and interceptor registration. All cross-component communication flows through this interface.
-
-**Key methods:**
-
-| Method                                                | Purpose                                                                       |
-|-------------------------------------------------------|-------------------------------------------------------------------------------|
-| `broadcastState(clazz, data)`                         | Emits a value into the state channel (upstream interceptors applied)          |
-| `triggerImpulse(clazz, data)`                         | Emits a fire-and-forget event into the reaction channel                       |
-| `handleRequest(impulseType, needType, impulse)`       | Routes a data request to the Provider system, returns `Flow<DataState<Need>>` |
-| `stateFlow(clazz)`                                    | Returns a downstream-intercepted `SharedFlow` for a state type (replay=1)     |
-| `impulseFlow(clazz)`                                  | Returns a downstream-intercepted `SharedFlow` for a reaction type (replay=0)  |
-| `getRawStateFlow(clazz)`                              | Returns the raw (unintercepted) state flow                                    |
-| `getRawImpulseFlow(clazz)`                            | Returns the raw (unintercepted) reaction flow                                 |
-| `addInterceptor(point, clazz, interceptor, priority)` | Registers an interceptor at a specific channel/direction point                |
-
-Reified extension functions are provided for all methods so callers rarely need to pass `KClass` tokens manually:
-
-```kotlin
-// Instead of:
-switchboard.broadcastState(UserProfile::class, profile)
-
-// Write:
-switchboard.broadcastState(profile)
-```
-
-A convenience `addLoggingInterceptors<T>` extension registers read-only interceptors at all 6 intercept points for a given type, with `Int.MIN_VALUE` priority upstream (runs first) and `Int.MAX_VALUE` downstream (runs last).
-
----
-
-#### `DefaultSwitchBoard`
-**Package:** `com.synapselib.arch.base`
-
-The concrete `SwitchBoard` implementation. Injectable via Hilt (`@Inject constructor`).
-
-**Internal architecture:**
+Shows how interceptors are chained and executed for a given intercept point.
 
 ```mermaid
 flowchart LR
-    subgraph DefaultSwitchBoard
-        direction TB
-        UP_INT["Upstream Interceptors"]
-        STATE_FLOW["State Flows<br/>(replay=1)"]
-        REACT_FLOW["Reaction Flows<br/>(replay=0)"]
-        DN_INT["Downstream Interceptors"]
-        PROV["ProviderManager<br/>• dedup by impulse equality<br/>• factory → Provider instance<br/>• ProviderScope (SB access)<br/>• DataState lifecycle"]
+    DATA["Input data<br/>(type T)"] --> R1
+
+    subgraph Pipeline ["InterceptorRegistry (sorted by priority)"]
+        direction LR
+        R1["Interceptor A<br/>priority=0"] --> R2["Interceptor B<br/>priority=5"]
+        R2 --> R3["Interceptor C<br/>priority=10"]
+        R3 --> TERM["Terminal<br/>identity fn"]
     end
 
-    BS["broadcastState()"] --> UP_INT
-    TI["triggerImpulse()"] --> UP_INT
-    HR["handleRequest()"] --> UP_INT
-    UP_INT --> STATE_FLOW
-    UP_INT --> REACT_FLOW
-    UP_INT --> PROV
-    STATE_FLOW --> DN_INT
-    REACT_FLOW --> DN_INT
-    PROV --> DN_INT
-    DN_INT --> SF_OUT["stateFlow()"]
-    DN_INT --> IF_OUT["impulseFlow()"]
-    DN_INT --> DS_OUT["Flow‹DataState‹T››"]
+    TERM --> OUT["Output data<br/>(type T)"]
+
+    style R1 fill:#e1f5fe
+    style R2 fill:#e1f5fe
+    style R3 fill:#e1f5fe
 ```
 
-**Backing data structures:**
+Each interceptor receives the data and a `Chain` handle. It can:
+- **Pass through**: `chain.proceed(data)` — observation/logging
+- **Transform**: `chain.proceed(modifiedData)` — mutation before next
+- **Short-circuit**: return a value without calling `proceed` — skip remaining interceptors
 
-| Store                    | Type                                                     | Purpose                                       |
-|--------------------------|----------------------------------------------------------|-----------------------------------------------|
-| `stateChannels`          | `ConcurrentHashMap<KClass, MutableSharedFlow<Any>>`      | Per-type state flows (replay=1)               |
-| `reactionChannels`       | `ConcurrentHashMap<KClass, MutableSharedFlow<Any>>`      | Per-type reaction flows (replay=0, buffer=64) |
-| `downstreamStateFlows`   | `ConcurrentHashMap<KClass, SharedFlow<Any>>`             | Cached downstream-intercepted state flows     |
-| `downstreamImpulseFlows` | `ConcurrentHashMap<KClass, SharedFlow<Any>>`             | Cached downstream-intercepted impulse flows   |
-| `interceptors`           | `ConcurrentHashMap<InterceptPoint, InterceptorRegistry>` | Per-point interceptor registries              |
-
-**Constructor parameters:**
-
-| Parameter                | Qualifier                      | Default          | Purpose                                                         |
-|--------------------------|--------------------------------|------------------|-----------------------------------------------------------------|
-| `scope`                  | `@SwitchBoardScope`            | —                | Parent `CoroutineScope` for `shareIn` and provider jobs         |
-| `providerRegistry`       | —                              | —                | Immutable impulse→factory mappings                              |
-| `workerContext`          | `@SwitchBoardWorkerContext`    | `Dispatchers.IO` | Coroutine context for provider execution                        |
-| `stopTimeoutMillis`      | `@SwitchBoardStopTimeout`      | 3000ms           | `WhileSubscribed` stop timeout for downstream shared flows      |
-| `replayExpirationMillis` | `@SwitchBoardReplayExpiration` | 3000ms           | `WhileSubscribed` replay expiration for downstream shared flows |
-
-The `stopTimeoutMillis` and `replayExpirationMillis` parameters are used exclusively in the `shareIn(scope, SharingStarted.WhileSubscribed(...))` calls that create cached downstream flows. They control how long the shared flow stays active after the last subscriber disconnects and how long the replay cache is retained.
+Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result.
 
 ---
 
-#### `LocalSwitchBoard`
-**Package:** `com.synapselib.arch.base`
+## 🧪 Testing
 
-A Compose `CompositionLocal` that provides the current `SwitchBoard` to the composition tree. Throws `IllegalStateException` if accessed without a provider.
-
-```kotlin
-// Providing
-CompositionLocalProvider(LocalSwitchBoard provides mySwitchBoard) {
-    MyApp()
-}
-
-// Consuming (automatic via CreateContext)
-val switchBoard = LocalSwitchBoard.current
-```
+See [synapse-arch-test](../arch-test/README.md) for `SynapseTestRule`, interceptor-based capture helpers, and provider stubbing.
 
 ---
 
-### Three Channels
+## 📄 License
 
-| Channel      | Replay            | Buffer          | Purpose                                                                                          | Produce            | Consume                     |
-|--------------|-------------------|-----------------|--------------------------------------------------------------------------------------------------|--------------------|-----------------------------|
-| **State**    | 1 (latest cached) | DROP_OLDEST     | Persistent state streams. New subscribers immediately get the last value.                        | `broadcastState()` | `stateFlow()` / `ListenFor` |
-| **Reaction** | 0 (no replay)     | 64, DROP_OLDEST | Fire-and-forget events (toasts, navigation, analytics). Only active collectors receive them.     | `triggerImpulse()` | `impulseFlow()` / `ReactTo` |
-| **Request**  | 1 (via provider)  | 64, DROP_OLDEST | Data-fetching requests routed to Providers. Returns `Flow<DataState<Need>>` with full lifecycle. | `handleRequest()`  | `Request`                   |
-
----
-
-### Impulse Types
-
-#### `Impulse`
-**Package:** `com.synapselib.arch.base`
-
-Base class for fire-and-forget reaction events. Subclass to define domain-specific events:
-
-```kotlin
-data class ShowToast(val message: String) : Impulse()
-data class NavigateTo(val route: String) : Impulse()
-object SessionExpired : Impulse()
-```
-
-Emitted via `Trigger()`, consumed via `ReactTo()`.
-
----
-
-#### `DataImpulse<Need>`
-**Package:** `com.synapselib.arch.base`
-
-Base class for typed data requests. The generic `Need` parameter declares the expected result type, enforced at compile time.
-
-```kotlin
-data class FetchUserProfile(val userId: Int) : DataImpulse<UserProfile>()
-data class SearchProducts(val query: String, val page: Int) : DataImpulse<ProductPage>()
-```
-
-**Critical:** Must be implemented as a `data class`. The provider system uses structural equality (`equals`/`hashCode`) for job deduplication — two `FetchUserProfile(42)` impulses share the same in-flight job, while `FetchUserProfile(42)` and `FetchUserProfile(99)` run concurrently. The KSP processor enforces this at compile time.
-
----
-
-### DataState
-
-#### `DataState<T>` (sealed interface)
-**Package:** `com.synapselib.core.typed`
-
-Represents the lifecycle of a data request:
-
-| Variant                | Properties                          | When                                                                                                        |
-|------------------------|-------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| `DataState.Idle`       | —                                   | Initial state before any request is made                                                                    |
-| `DataState.Loading`    | —                                   | Request is in-flight                                                                                        |
-| `DataState.Success<T>` | `data: T`                           | Request completed successfully                                                                              |
-| `DataState.Error<T>`   | `cause: Throwable`, `staleData: T?` | Request failed. `staleData` holds the last successful value (if any) for stale-while-revalidate UI patterns |
-
-**Extension properties:**
-
-| Extension    | Returns   | Purpose                                   |
-|--------------|-----------|-------------------------------------------|
-| `dataOrNull` | `T?`      | Extracts `Success.data` or returns `null` |
-| `isLoading`  | `Boolean` | `true` when in `Loading` state            |
-
----
-
-### Type-Safe Flow Adapters
-
-**Package:** `com.synapselib.core.typed`
-
-These are lightweight, stateless adapters that narrow erased flows to typed flows using `Class.cast` on every element. They avoid unchecked generic casts and throw `ClassCastException` eagerly on type mismatches.
-
-| Adapter                  | Narrows                                                 | Used By                                                              |
-|--------------------------|---------------------------------------------------------|----------------------------------------------------------------------|
-| `TypedSharedFlow<T>`     | `SharedFlow<Any>` → `SharedFlow<T>`                     | `DefaultSwitchBoard.stateFlow()`, `DefaultSwitchBoard.impulseFlow()` |
-| `TypedStateFlow<T>`      | `StateFlow<Any>` → `StateFlow<T>`                       | Available for external use                                           |
-| `TypedDataSharedFlow<T>` | `SharedFlow<DataState<*>>` → `SharedFlow<DataState<T>>` | `ProviderManager.ActiveJob.typedFlow()`                              |
-| `TypedDataStateFlow<T>`  | `StateFlow<DataState<*>>` → `StateFlow<DataState<T>>`   | Available for external use                                           |
-
-The `DataState`-aware adapters (`TypedDataSharedFlow`, `TypedDataStateFlow`) perform element-wise casting on the **inner** data values:
-- `Idle` and `Loading` pass through unchanged (no data to cast).
-- `Success` → `data` is cast via `Class.cast`.
-- `Error` → `staleData` (if non-null) is cast via `Class.cast`.
-
-All adapters are inexpensive to instantiate (no coroutines, no buffering) — the expensive `shareIn` work lives in the source flow.
-
----
-
-### Interceptor System
-
-#### `Interceptor<T>` (fun interface)
-**Package:** `com.synapselib.arch.base`
-
-A composable middleware unit (similar to OkHttp interceptors). Receives data and a `Chain` handle. Can:
-
-- **Pass through**: call `chain.proceed(data)` unchanged (observation/logging).
-- **Transform**: modify data before/after calling `chain.proceed`.
-- **Short-circuit**: return a value without calling `chain.proceed`, skipping all downstream interceptors.
-
-**Factory methods:**
-
-| Factory                                          | Behavior                                          |
-|--------------------------------------------------|---------------------------------------------------|
-| `Interceptor.read { data -> ... }`               | Observe only — always proceeds with original data |
-| `Interceptor.transform { data -> modifiedData }` | Maps data before proceeding                       |
-| `Interceptor.full { data, proceed -> ... }`      | Full control: retry, skip, wrap, etc.             |
-
-```kotlin
-// Logging (read-only)
-Interceptor.read<UserProfile> { profile ->
-    logger.info("Profile loaded: ${profile.name}")
-}
-
-// Add auth token (transform)
-Interceptor.transform<NetworkRequest> { request ->
-    request.copy(token = authManager.currentToken)
-}
-
-// Retry on failure (full control)
-Interceptor.full<ApiCall> { call, proceed ->
-    try {
-        proceed(call)
-    } catch (e: Exception) {
-        proceed(call.copy(retryCount = call.retryCount + 1))
-    }
-}
-```
-
----
-
-#### `Interceptor.Chain<T>` (fun interface)
-
-Handle to invoke the next interceptor in the pipeline. The terminal handler is the identity function (`{ it }`).
-
----
-
-#### `InterceptPoint`
-**Package:** `com.synapselib.arch.base`
-
-A coordinate of `(Channel, Direction)` identifying where an interceptor is installed. Six possible points:
-
-| Point                    | Meaning                                                                 |
-|--------------------------|-------------------------------------------------------------------------|
-| `(STATE, UPSTREAM)`      | Before a state broadcast is emitted to the flow                         |
-| `(STATE, DOWNSTREAM)`    | Before a collected state value is delivered to the listener             |
-| `(REACTION, UPSTREAM)`   | Before a reaction event is emitted to the flow                          |
-| `(REACTION, DOWNSTREAM)` | Before a collected reaction is delivered to the listener                |
-| `(REQUEST, UPSTREAM)`    | Before request params reach the ProviderManager                         |
-| `(REQUEST, DOWNSTREAM)`  | After the provider produces a result, before it's emitted to the caller |
-
----
-
-#### `Direction` (enum)
-
-| Value        | Meaning                                                 |
-|--------------|---------------------------------------------------------|
-| `UPSTREAM`   | Data flowing **into** the SwitchBoard (producer-side)   |
-| `DOWNSTREAM` | Data flowing **out of** the SwitchBoard (consumer-side) |
-
----
-
-#### `Channel` (enum)
-
-| Value      | Meaning                                                    |
-|------------|------------------------------------------------------------|
-| `REQUEST`  | One-shot request/response interactions via ProviderManager |
-| `STATE`    | Persistent, replay-1 state streams                         |
-| `REACTION` | Fire-and-forget event streams with no replay               |
-
----
-
-#### `InterceptorRegistry`
-**Package:** `com.synapselib.arch.base`
-
-Thread-safe, priority-ordered store of interceptors keyed by `KClass`.
-
-**Ordering:** Interceptors execute in ascending priority order (lowest value first). Ties are broken by insertion order (FIFO).
-
-**Internal structure:**
-- `ConcurrentHashMap<KClass, ConcurrentSkipListSet<Entry>>` — primary storage.
-- `ConcurrentHashMap<KClass, VersionedSnapshot>` — resolved cache with version-stamp invalidation.
-- `AtomicLong` counters for insertion ordering and version tracking.
-
-**Type resolution:** When applying interceptors for a type `T`, the registry finds all entries whose registered `KClass` is a supertype of `T` (via `Class.isAssignableFrom`), merges and sorts them, and caches the result. The cache is invalidated when the global version counter advances (on any add/remove).
-
-**Chain construction:** Built iteratively from tail to head — each link is a lambda capturing the entry and the next chain reference. The terminal handler is the identity function.
-
----
-
-#### `Registration` (fun interface)
-
-Handle returned when registering an interceptor. Call `unregister()` to remove. Idempotent — later calls are safe no-ops. In-flight executions that already captured a chain snapshot are unaffected.
-
----
-
-#### `InterceptorPipeline` (interface)
-
-Minimal interface for applying interceptors to a value. `InterceptorRegistry` implements this. `DefaultSwitchBoard` uses an `EmptyPipeline` singleton (returns data unchanged) when no interceptors are registered for a given point.
-
----
-
-### Provider System (Data Fetching)
-
-#### `Provider<I, Need>` (abstract class)
-**Package:** `com.synapselib.arch.base.provider`
-
-The data-fetching backbone of SynapseLib. A cold-start data producer that handles a specific `DataImpulse` type.
-
-**Lifecycle:** Providers are factory-instantiated — they don't exist until a matching `DataImpulse` arrives. The `ProviderManager` creates them on demand, collects their output, wraps it in `DataState`, and disposes them when work is complete.
-
-**Single abstract method:**
-
-```kotlin
-abstract fun ProviderScope.produce(impulse: I): Flow<Need>
-```
-
-**Usage patterns:**
-
-```kotlin
-// One-shot fetch
-@SynapseProvider
-class FetchUserProfileProvider @Inject constructor(
-    private val api: UserApi,
-) : Provider<FetchUserProfile, UserProfile>() {
-    override fun ProviderScope.produce(impulse: FetchUserProfile) = flow {
-        emit(api.getProfile(impulse.userId))
-    }
-}
-
-// Streaming / observation
-@SynapseProvider
-class WatchCartProvider @Inject constructor(
-    private val cartDao: CartDao,
-) : Provider<WatchCart, Cart>() {
-    override fun ProviderScope.produce(impulse: WatchCart): Flow<Cart> =
-        cartDao.observeCart(impulse.cartId)
-}
-
-// Provider that uses SwitchBoard capabilities
-@SynapseProvider
-class FetchAuthenticatedDataProvider @Inject constructor(
-    private val api: SecureApi,
-) : Provider<FetchSecureData, SecurePayload>() {
-    override fun ProviderScope.produce(impulse: FetchSecureData) = flow {
-        val token = ListenFor<AuthToken>().first()
-        emit(api.fetch(impulse.endpoint, token))
-    }
-}
-```
-
----
-
-#### `ProviderScope`
-**Package:** `com.synapselib.arch.base.provider`
-
-A lightweight, scoped context given to Providers during execution. Implements `CoroutineScope` by delegation, so `launch`, `async`, etc. are available inside `produce`.
-
-**Capabilities:**
-
-| Method                      | Purpose                                                        |
-|-----------------------------|----------------------------------------------------------------|
-| `ListenFor<O>()`            | Returns `SharedFlow<O>` from the state channel                 |
-| `ReactTo<A>()`              | Returns `SharedFlow<A>` from the reaction channel              |
-| `Broadcast(data)`           | Emits state into the SwitchBoard                               |
-| `Trigger(event)`            | Fires a reaction impulse                                       |
-| `Request<Need, I>(impulse)` | Issues a nested data request (returns `Flow<DataState<Need>>`) |
-
-The lifecycle is framework-managed — the `ProviderManager` creates and destroys the scope based on subscriber demand.
-
----
-
-#### `ProviderFactory<I, Need>` (fun interface)
-
-Factory that creates `Provider` instances on demand (cold-start). The `ProviderManager` holds these and invokes them when a matching `DataImpulse` arrives.
-
-```kotlin
-fun interface ProviderFactory<I : DataImpulse<Need>, Need : Any> {
-    fun create(): Provider<I, Need>
-}
-```
-
-In DI-managed projects, KSP generates the factory registrations automatically from `@SynapseProvider`-annotated classes.
-
----
-
-#### `ProviderRegistry`
-**Package:** `com.synapselib.arch.base.provider`
-
-Immutable (after construction) map of `KClass<DataImpulse>` → `RegisteredFactory`. The **only** place where impulse→provider relationships are declared.
-
-**Construction via Builder:**
-
-```kotlin
-val registry = ProviderRegistry.Builder()
-    .register<UserProfile, FetchUserProfile> {
-        FetchUserProfileProvider(api)
-    }
-    .register<ProductPage, SearchProducts> {
-        SearchProductsProvider(api)
-    }
-    .build()
-```
-
-**Multi-module composition:**
-
-```kotlin
-val registry = ProviderRegistry.Builder()
-    .mergeFrom(featureARegistry)
-    .mergeFrom(featureBRegistry)
-    .build()
-```
-
-**Query methods:**
-
-| Method                     | Purpose                                               |
-|----------------------------|-------------------------------------------------------|
-| `hasProvider(impulseType)` | Returns `true` if a provider is registered            |
-| `registeredImpulseTypes()` | Returns the set of all registered `DataImpulse` types |
-| `size`                     | Total number of registered providers                  |
-
-**`ProviderRegistry.EMPTY`** — an empty registry for use in tests.
-
----
-
-#### `ProviderRegistry.RegisteredFactory<I, Need>` (internal)
-
-Type-safe wrapper pairing `Class` tokens with a `ProviderFactory`. Encapsulates all type-erased operations so callers never interact with erased generics directly.
-
-| Method                                             | Purpose                                                                         |
-|----------------------------------------------------|---------------------------------------------------------------------------------|
-| `castImpulse(impulse: Any): I`                     | Checked cast via `Class.cast`                                                   |
-| `createProvider(): Provider<I, Need>`              | Delegates to the factory                                                        |
-| `produceErased(impulse, providerScope): Flow<Any>` | Creates provider, casts impulse, invokes `produce`, returns widened `Flow<Any>` |
-
----
-
-#### `ProviderManager`
-**Package:** `com.synapselib.arch.base.provider`
-
-**Internal** runtime engine (not public API). The `SwitchBoard` delegates to it. Manages:
-
-1. **Job deduplication**: Active jobs are keyed by `DataImpulse` instance (structural equality). Identical impulses share the same `SharedFlow<DataState>`.
-2. **Concurrency limiting**: Configurable `maxConcurrentJobs` (0 = unbounded). Excess requests receive `DataState.Error(ProviderConcurrencyException)`.
-3. **Isolation**: Each job runs under a `SupervisorJob`, so one provider's failure doesn't cancel others.
-4. **DataState lifecycle**: Automatically emits `Loading` → `Success`/`Error`. Tracks `lastSuccess` for stale-data support.
-5. **Cleanup**: Completed jobs are removed from the active table in a `finally` block.
-
-**Request flow:**
-
-```mermaid
-flowchart TD
-    REQ["request(impulseType, needType, impulse, switchboard)"]
-    REQ --> DEDUP{"Active job for<br/>this impulse?"}
-
-    DEDUP -->|YES| RETURN_EXISTING["Return existing typedFlow(needType)"]
-
-    DEDUP -->|NO| CONC{"Concurrency<br/>limit reached?"}
-    CONC -->|YES| RETURN_ERROR["Return DataState.Error<br/>(ProviderConcurrencyException)"]
-
-    CONC -->|NO| RESOLVE{"Resolve factory<br/>from ProviderRegistry"}
-    RESOLVE -->|NOT FOUND| THROW["throw NoProviderException"]
-
-    RESOLVE -->|FOUND| LAUNCH["Launch Provider"]
-    LAUNCH --> STEP1["1. Create MutableSharedFlow‹DataState‹Need››<br/>(replay=1, buffer=64)"]
-    STEP1 --> STEP2["2. Wait for first subscriber"]
-    STEP2 --> STEP3["3. Create ProviderScope(switchboard, coroutineScope)"]
-    STEP3 --> STEP4["4. Emit DataState.Loading"]
-    STEP4 --> STEP5["5. Call registered.produceErased(impulse, providerScope)"]
-    STEP5 --> STEP6["6. Collect: value → Class.cast → lastSuccess.update → emit Success"]
-
-    STEP6 --> DONE["Flow complete"]
-    STEP5 -->|Exception| STEP7["7. Emit DataState.Error(throwable, lastSuccess)"]
-    STEP7 --> FINALLY["8. Remove from activeJobs"]
-    DONE --> FINALLY
-```
-
----
-
-#### `ActiveJob<Need>` (internal to ProviderManager)
-
-Bundles the shared `DataState` flow with its coroutine `Job` and the `Class` token for checked casts.
-
-| Property                                  | Purpose                                                        |
-|-------------------------------------------|----------------------------------------------------------------|
-| `needClass: Class<Need>`                  | Type token for runtime verification                            |
-| `sharedFlow: SharedFlow<DataState<Need>>` | The flow driving DataState transitions                         |
-| `job: Job`                                | The coroutine backing this provider execution                  |
-| `lastSuccess: MutableStateFlow<Need?>`    | Tracks the most recent successful value for stale-data support |
-
-The `typedFlow(expectedClass)` method returns a `TypedDataSharedFlow` that performs checked element-wise casting — no unchecked casts anywhere in the chain.
-
----
-
-#### Exceptions
-
-| Exception                      | When                                                                                                                  |
-|--------------------------------|-----------------------------------------------------------------------------------------------------------------------|
-| `NoProviderException`          | A `DataImpulse` is dispatched but no `ProviderFactory` is registered. Should never occur with KSP validation enabled. |
-| `ProviderConcurrencyException` | The `ProviderManager`'s `maxConcurrentJobs` limit has been reached. Returned as `DataState.Error`.                    |
-
----
-
-### Compose DSL
-
-#### `CreateContext<T>`
-**Package:** `com.synapselib.arch.base`
-
-Top-level composable that establishes a **context boundary**. Pairs an arbitrary context value (a shared domain object, configuration, or service locator) with the nearest `SwitchBoard` from `LocalSwitchBoard`. Synapse replaces MVVM entirely — there are no ViewModels in a correctly configured Synapse application.
-
-```kotlin
-@Composable
-fun MyFeature(appServices: AppServices) {
-    CreateContext(appServices) {
-        // `this` is ContextScope<AppServices>
-        Node(initialState = UiState()) {
-            // `this` is NodeScope<AppServices, UiState>
-        }
-    }
-}
-```
-
-The `ContextScope` is `remember`ed by `context` and `switchboard`, so it's recreated only when either identity changes.
-
----
-
-#### `ContextScope<T>`
-**Package:** `com.synapselib.arch.base`
-
-Holds the shared context value and `SwitchBoard` reference. Provides suspending `Trigger` and `Broadcast` functions for use from coroutines.
-
----
-
-#### `Node<C, S>`
-**Package:** `com.synapselib.arch.base`
-
-Composable that creates a **stateful node** inside a `ContextScope`. The fundamental unit of the Compose DSL.
-
-**Features:**
-- **Local state** of type `S`, managed via `NodeScope.update`.
-- **Automatic state persistence**: If `S` has a `KSerializer` (kotlinx.serialization), state is saved/restored via `rememberSaveable`. Otherwise, falls back to `remember`.
-- **Lifecycle-aware disposal**: Interceptors registered via `Intercept` are automatically unregistered when the node leaves the composition.
-
----
-
-#### `NodeScope<C, S>`
-**Package:** `com.synapselib.arch.base`
-
-The primary DSL receiver inside a `Node`.
-
-**Capabilities:**
-
-| Category              | Methods                                   | Composable?                |
-|-----------------------|-------------------------------------------|----------------------------|
-| **Local state**       | `update { reducer }`                      | No — call from callbacks   |
-| **State broadcast**   | `Broadcast(data)`                         | No — suspending            |
-| **Reactions**         | `Trigger(event)`                          | No — suspending            |
-| **Interception**      | `Intercept(point, interceptor, priority)` | No — registers immediately |
-| **Request**           | `Request(impulse, key) { callback }`      | Yes — lifecycle-aware      |
-| **Listen (state)**    | `ListenFor(stateKey) { handler }`         | Yes — lifecycle-aware      |
-| **Listen (reaction)** | `ReactTo(reactionKey) { handler }`        | Yes — lifecycle-aware      |
-
-**Properties:**
-
-| Property  | Type             | Purpose                                                            |
-|-----------|------------------|--------------------------------------------------------------------|
-| `context` | `C`              | Read-only access to the value from `CreateContext`                 |
-| `state`   | `S`              | Current snapshot of local state (triggers recomposition on change) |
-| `scope`   | `CoroutineScope` | For launching coroutines from callbacks                            |
-
-**Lifecycle-aware subscriptions** (`ListenFor`, `ReactTo`, `Request`) use `DisposableEffect` internally — they're canceled and relaunched when their key changes, and canceled when the composable leaves the composition. Handlers are wrapped with `rememberUpdatedState` so the latest lambda is always called.
-
-```kotlin
-Node(initialState = ScreenState()) {
-    // Read state
-    Text("Count: ${state.count}")
-
-    // Update state
-    Button(onClick = { update { it.copy(count = it.count + 1) } }) {
-        Text("Increment")
-    }
-
-    // Listen for external state
-    ListenFor<ThemeSettings> { settings ->
-        update { it.copy(darkMode = settings.darkMode) }
-    }
-
-    // React to events
-    ReactTo<NavigateTo> { event ->
-        navController.navigate(event.route)
-    }
-
-    // Data request
-    Request<UserProfile, FetchUserProfile>(
-        impulse = FetchUserProfile(userId = 42),
-    ) { dataState ->
-        update { it.copy(profileState = dataState) }
-    }
-
-    // Intercept outgoing requests
-    Intercept<NetworkRequest>(
-        point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
-        interceptor = Interceptor.transform { req -> req.copy(token = authToken) },
-    )
-}
-```
-
----
-
-#### `rememberState<S>`
-**Package:** `com.synapselib.arch.base`
-
-Internal helper used by `Node`. Attempts to find a `KSerializer<S>` via `serializer<S>()`. If found, uses `rememberSaveable` with a JSON-based `Saver` for state persistence across configuration changes. If no serializer is available, falls back to `remember { mutableStateOf(initialState) }`.
-
----
-
-### Non-Compose Layer (Coordinator)
-
-#### `Coordinator()`
-**Package:** `com.synapselib.arch.base`
-
-Factory function that creates a `CoordinatorScope` and runs an initialization block. The primary entry point for wiring SwitchBoard communication outside Compose — typically from activities, services, or background processes.
-
-```kotlin
-val coordinator = Coordinator(switchboard, lifecycleScope) {
-    // Wire up listeners
-    ListenFor<AppConfig> { config ->
-        applyConfig(config)
-    }
-
-    ReactTo<SessionExpired> {
-        launch { Trigger(NavigateToLogin) }
-    }
-
-    // Register interceptors
-    Intercept<AnalyticsEvent>(
-        point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
-        interceptor = Interceptor.read { event -> analytics.track(event) },
-    )
-}
-
-// Later, when done:
-coordinator.dispose()
-```
-
----
-
-#### `CoordinatorScope`
-**Package:** `com.synapselib.arch.base`
-
-Long-lived, manually managed counterpart to `NodeScope`. Implements `CoroutineScope` by delegation.
-
-**Two overload styles for every consumption method:**
-
-| Category              | Flow overload (returns flow)                          | Handler overload (launch + collect)                        |
-|-----------------------|-------------------------------------------------------|------------------------------------------------------------|
-| **State broadcast**   | —                                                     | `Broadcast(data)` (suspending)                             |
-| **Reactions**         | —                                                     | `Trigger(event)` (suspending)                              |
-| **Interception**      | —                                                     | `Intercept(point, interceptor, priority)` → `Registration` |
-| **Listen (state)**    | `ListenFor<O>()` → `SharedFlow<O>`                    | `ListenFor<O> { handler }` → `Job`                         |
-| **Listen (reaction)** | `ReactTo<A>()` → `SharedFlow<A>`                      | `ReactTo<A> { handler }` → `Job`                           |
-| **Request**           | `Request<Need, I>(impulse)` → `Flow<DataState<Need>>` | `Request<Need, I>(impulse) { callback }` → `Job`           |
-
-Flow overloads are useful for composition, filtering, debouncing, or other transformations before collecting:
-
-```kotlin
-val coordinator = Coordinator(switchboard) {
-    val configFlow = ListenFor<AppConfig>()
-    val flagsFlow = ListenFor<FeatureFlags>()
-
-    launch {
-        combine(configFlow, flagsFlow) { config, flags ->
-            resolveSettings(config, flags)
-        }.collectLatest { settings ->
-            Broadcast(settings)
-        }
-    }
-}
-```
-
-Handler overloads run with `CoordinatorScope` as the receiver, giving direct access to `Broadcast`, `Trigger`, `launch`, etc.
-
-**Lifecycle — `dispose()`:**
-1. Cancels the backing coroutine job and all children.
-2. Unregisters all interceptors added via `Intercept`.
-3. Clears the internal registration list.
-
-Idempotent — calling multiple times is safe.
-
----
-
-### KSP Code Generation
-
-#### `@SynapseProvider` (annotation)
-**Package:** `com.synapselib.arch.base.provider`
-
-Source-retention annotation marking a concrete `Provider` subclass for compile-time validation and automatic `ProviderRegistry` wiring.
-
-**Requirements for annotated classes:**
-1. Must be a **concrete** (non-abstract) class.
-2. Must directly extend `Provider<I, Need>` with concrete type arguments.
-3. Should have an `@Inject` constructor (for Hilt) or be resolvable by Koin.
-4. The `DataImpulse` type argument (`I`) must be a `data class`.
-
----
-
-#### `ProviderProcessor`
-**Package:** `com.synapselib.arch.base.provider`
-
-KSP `SymbolProcessor` that processes `@SynapseProvider` annotations.
-
-**Processing pipeline:**
-
-```
-Phase 1: Validate & Extract
-    ├─ Must be a class (not interface/object/enum)
-    ├─ Must not be abstract
-    ├─ Must extend Provider<I, Need>
-    ├─ Type arguments must be concrete (no star projections)
-    ├─ DataImpulse must be a data class
-    └─ Warn if no @Inject constructor
-
-Phase 2: Detect Duplicates
-    └─ No two @SynapseProvider classes may handle the same DataImpulse type
-
-Phase 3: Generate Code
-    ├─ If Hilt on classpath → generate Hilt @Module
-    ├─ If Koin on classpath → generate Koin module
-    └─ If neither → compile error
-```
-
-**Compile-time errors reported for:**
-- `@SynapseProvider` on a non-class declaration
-- `@SynapseProvider` on an abstract class
-- Class doesn't extend `Provider`
-- Unresolvable type arguments / star projections
-- Duplicate providers for the same `DataImpulse` type
-- No supported DI framework found
-
-**Compile-time warning for:**
-- No `@Inject` constructor (Hilt won't be able to provide dependencies)
-
----
-
-#### `ProviderProcessorProvider`
-**Package:** `com.synapselib.arch.base.provider`
-
-KSP entry point discovered via `@AutoService`. Reads the `synapse.moduleName` KSP option (defaults to `"App"`), sanitizes it (e.g., `"feature-login"` → `"FeatureLogin"`), and creates the `ProviderProcessor`.
-
----
-
-#### Generated Hilt Module
-
-For each Gradle module, generates `SynapseProviderModule_{ModuleName}`:
-
-```kotlin
-@Module
-@InstallIn(SingletonComponent::class)
-object SynapseProviderModule_App {
-
-    @Provides
-    @Singleton
-    fun provideRegistry(
-        fetchUserProfileProvider: javax.inject.Provider<FetchUserProfileProvider>,
-        searchProductsProvider: javax.inject.Provider<SearchProductsProvider>,
-    ): ProviderRegistry {
-        return ProviderRegistry.Builder()
-            .register(
-                impulseType = FetchUserProfile::class,
-                needClass = UserProfile::class.java,
-                factory = ProviderFactory { fetchUserProfileProvider.get() },
-            )
-            .register(
-                impulseType = SearchProducts::class,
-                needClass = ProductPage::class.java,
-                factory = ProviderFactory { searchProductsProvider.get() },
-            )
-            .build()
-    }
-}
-```
-
-Uses `javax.inject.Provider<T>` for lazy cold-start factories — each `.get()` call creates a new instance.
-
-For parameterized `Need` types (e.g., `List<UserProfile>`), the generated code includes `@Suppress("UNCHECKED_CAST")` with a JVM erasure cast on the `Class` token — this is safe and standard.
-
-**Testing override:**
-
-```kotlin
-@UninstallModules(SynapseProviderModule_App::class)
-@HiltAndroidTest
-class MyTest {
-    @BindValue
-    val registry = ProviderRegistry.Builder()
-        .register<UserProfile, FetchUserProfile> { FakeProvider() }
-        .build()
-}
-```
-
----
-
-#### Generated Koin Module
-
-For each Gradle module, generates `synapseProviderModule_{ModuleName}`:
-
-```kotlin
-val synapseProviderModule_app = module {
-
-    factory { get<FetchUserProfileProvider>() }
-    factory { get<SearchProductsProvider>() }
-
-    single<ProviderRegistry> {
-        ProviderRegistry.Builder()
-            .register(
-                impulseType = FetchUserProfile::class,
-                needClass = UserProfile::class.java,
-                factory = ProviderFactory { get<FetchUserProfileProvider>() },
-            )
-            .register(
-                impulseType = SearchProducts::class,
-                needClass = ProductPage::class.java,
-                factory = ProviderFactory { get<SearchProductsProvider>() },
-            )
-            .build()
-    }
-}
-```
-
-The generated code assumes Koin can resolve each provider class via constructor injection (Koin's built-in resolution). Users must ensure their provider classes are declared in a Koin module or are resolvable through Koin's standard mechanisms.
-
-**Usage:**
-
-```kotlin
-startKoin {
-    modules(synapseProviderModule_app)
-}
-```
-
-**Testing override:**
-
-```kotlin
-loadKoinModules(module {
-    single<ProviderRegistry> {
-        ProviderRegistry.Builder()
-            .register<UserProfile, FetchUserProfile> { FakeProvider() }
-            .build()
-    }
-})
-```
-
----
-
-## Data Flow Summary
-
-### State Broadcast & Consumption
-
-```mermaid
-sequenceDiagram
-    participant P as Producer
-    participant UP as Upstream Interceptors
-    participant SF as MutableSharedFlow<br/>(replay=1)
-    participant DN as Downstream Interceptors
-    participant C as Consumer
-
-    P->>UP: Broadcast(data)
-    UP->>SF: intercepted data
-    Note over SF: Stores latest value
-    C->>SF: ListenFor<T>()
-    SF->>DN: raw value
-    DN->>C: intercepted value
-    Note over C: New subscribers get<br/>latest value immediately
-```
-
-### Reaction (Impulse) Flow
-
-```mermaid
-sequenceDiagram
-    participant P as Producer
-    participant UP as Upstream Interceptors
-    participant RF as MutableSharedFlow<br/>(replay=0)
-    participant DN as Downstream Interceptors
-    participant C as Consumer
-
-    P->>UP: Trigger(event)
-    UP->>RF: intercepted event
-    Note over RF: No replay — only<br/>active collectors receive
-    RF->>DN: raw event
-    DN->>C: intercepted event via ReactTo
-    Note over C: Missed if not<br/>actively collecting
-```
-
-### Request Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant UP as Upstream Interceptors
-    participant SB as SwitchBoard
-    participant PM as ProviderManager
-    participant PR as Provider
-    participant DN as Downstream Interceptors
-
-    C->>UP: Request(impulse)
-    UP->>SB: intercepted impulse
-    SB->>PM: handleRequest(impulse)
-
-    alt Identical impulse already active
-        PM-->>SB: existing SharedFlow (dedup)
-    else Concurrency limit reached
-        PM-->>SB: DataState.Error(ConcurrencyException)
-    else New request
-        PM->>PM: Resolve factory from ProviderRegistry
-        PM->>PR: Create Provider + ProviderScope
-        PM-->>SB: DataState.Loading
-        PR-->>PM: emit value(s)
-        PM-->>SB: DataState.Success(value)
-        Note over PM: On exception
-        PM-->>SB: DataState.Error(cause, lastSuccess)
-        Note over PM: Finally: remove from activeJobs
-    end
-
-    SB->>DN: DataState result
-    DN->>C: Flow<DataState<T>>
-```
+Synapse Arch is available under the Mozilla Public License 2.0. See the [LICENSE](../LICENSE) file for more info.

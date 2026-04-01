@@ -8,6 +8,7 @@ import com.synapselib.core.typed.TypedSharedFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -350,6 +351,9 @@ class DefaultSwitchBoard @Inject constructor(
     /** Global logger that will intercept all flows, upstream and downstream read-only **/
     private val globalLogger = AtomicReference<((InterceptPoint, KClass<*>, Any) -> Unit)?>(null)
 
+    /** Trace listener invoked when a [TraceContext] is present in the coroutine context. */
+    private val traceListener = AtomicReference<((TraceContext, InterceptPoint, KClass<*>, Any) -> Unit)?>(null)
+
     /** The sharing strategy **/
     private var sharingStarted: SharingStarted =                                                                      
           SharingStarted.WhileSubscribed(stopTimeoutMillis, replayExpirationMillis)                                     
@@ -499,6 +503,27 @@ class DefaultSwitchBoard @Inject constructor(
     }
 
     /**
+     * Sets a trace listener that is invoked whenever a [TraceContext] is present
+     * in the coroutine context during a [broadcastState] or [triggerImpulse] call.
+     *
+     * Unlike [setGlobalLogger], this listener receives the [TraceContext] metadata
+     * (emitter tag, trace ID, timestamp) in addition to the intercept point, type,
+     * and data. It fires only when tracing is active — callers without a tag pay
+     * no overhead.
+     *
+     * @param listener the callback, or `null` to remove the current listener.
+     */
+    fun setTraceListener(listener:
+                         (
+                             (trace: TraceContext,
+                              point: InterceptPoint,
+                              clazz: KClass<*>, data: Any) -> Unit
+                         )?
+    ) {
+        traceListener.set(listener)
+    }
+
+    /**
      * Processes the provided data through the interceptor pipeline associated with the given intercept point
      * and class, then logs the result using the global logger, if one is set.
      *
@@ -510,6 +535,10 @@ class DefaultSwitchBoard @Inject constructor(
     private suspend fun <T : Any> processAndLog(point: InterceptPoint, clazz: KClass<out T>, data: T): T {
         val processed = pipelineFor(point).applyInterceptors(clazz, data)
         globalLogger.get()?.invoke(point, clazz, processed)
+        val trace = currentCoroutineContext()[TraceContext]
+        if (trace != null) {
+            traceListener.get()?.invoke(trace, point, clazz, processed)
+        }
         return processed
     }
 

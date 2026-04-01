@@ -15,6 +15,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
@@ -66,15 +67,20 @@ open class Impulse
  * @param T       the type of the context value.
  * @param context the value made available to all child scopes via
  *                [ContextScope.context].
+ * @param tag     optional human-readable label (e.g., `"CheckoutScreen"`)
+ *                attached to a [TraceContext] on every [ContextScope.Trigger]
+ *                and [ContextScope.Broadcast] call. When `null` (the default),
+ *                no tracing overhead is incurred.
  * @param block   composable content that runs inside the [ContextScope].
  */
 @Composable
 inline fun <T> CreateContext(
     context: T,
+    tag: String? = null,
     crossinline block: @Composable ContextScope<T>.() -> Unit,
 ) {
     val switchboard = LocalSwitchBoard.current
-    val scope = remember(context, switchboard) { ContextScope(context, switchboard) }
+    val scope = remember(context, switchboard, tag) { ContextScope(context, switchboard, tag) }
     scope.block()
 }
 
@@ -92,10 +98,14 @@ inline fun <T> CreateContext(
  *                       context boundary (e.g., a ViewModel).
  * @property switchboard the [SwitchBoard] used for all cross-node communication
  *                       (state broadcasts, reactions, requests, interception).
+ * @property tag         optional emitter label for [TraceContext]. When non-null,
+ *                       every [Trigger] and [Broadcast] call wraps execution in a
+ *                       `withContext(TraceContext(emitterTag = tag))`.
  */
 class ContextScope<T>(
     val context: T,
     val switchboard: SwitchBoard,
+    val tag: String? = null,
 ) {
     /**
      * Triggers a fire-and-forget [Impulse] on the [SwitchBoard]'s reaction channel.
@@ -114,7 +124,13 @@ class ContextScope<T>(
      * @param event the impulse event to emit.
      */
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        switchboard.triggerImpulse(event)
+        if (tag != null) {
+            withContext(TraceContext(emitterTag = tag)) {
+                switchboard.triggerImpulse(event)
+            }
+        } else {
+            switchboard.triggerImpulse(event)
+        }
     }
 
     /**
@@ -135,7 +151,13 @@ class ContextScope<T>(
      * @param data the value to broadcast.
      */
     suspend inline fun <reified O : Any> Broadcast(data: O) {
-        switchboard.broadcastState(data)
+        if (tag != null) {
+            withContext(TraceContext(emitterTag = tag)) {
+                switchboard.broadcastState(data)
+            }
+        } else {
+            switchboard.broadcastState(data)
+        }
     }
 }
 

@@ -244,8 +244,11 @@ class SynapseTestRule(
      * }
      * ```
      */
-    fun Coordinator(block: CoordinatorScope.() -> Unit): CoordinatorScope {
-        val scope = Coordinator(switchBoard, lifecycleOwner, block)
+    fun Coordinator(
+        tag: String? = null,
+        block: CoordinatorScope.() -> Unit,
+    ): CoordinatorScope {
+        val scope = Coordinator(switchBoard, lifecycleOwner, tag, block)
         coordinators += scope
         return scope
     }

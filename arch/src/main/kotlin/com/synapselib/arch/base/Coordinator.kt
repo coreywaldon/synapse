@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Creates a lifecycle-aware [CoordinatorScope] and runs [block] with it as the
@@ -28,6 +29,10 @@ import kotlinx.coroutines.launch
  * @param owner       the [LifecycleOwner] whose lifecycle governs this
  *                    coordinator's lifespan. The coordinator will auto-dispose
  *                    on [Lifecycle.Event.ON_DESTROY].
+ * @param tag         optional human-readable label (e.g., `"AuthCoordinator"`)
+ *                    attached to a [TraceContext] on every [CoordinatorScope.Trigger]
+ *                    and [CoordinatorScope.Broadcast] call. When `null` (the default),
+ *                    no tracing overhead is incurred.
  * @param block       initialization block — wire up listeners, interceptors, and
  *                    initial broadcasts here. Runs synchronously before the
  *                    function returns.
@@ -38,8 +43,9 @@ import kotlinx.coroutines.launch
 fun Coordinator(
     switchboard: SwitchBoard,
     owner: LifecycleOwner,
+    tag: String? = null,
     block: CoordinatorScope.() -> Unit,
-): CoordinatorScope = CoordinatorScope(switchboard, owner).apply(block)
+): CoordinatorScope = CoordinatorScope(switchboard, owner, tag).apply(block)
 
 /**
  * A long-lived, lifecycle-aware, non-Compose counterpart to [NodeScope].
@@ -96,10 +102,14 @@ fun Coordinator(
  *
  * @param switchboard    the [SwitchBoard] this scope communicates through.
  * @param owner          the [LifecycleOwner] governing this coordinator's lifespan.
+ * @param tag            optional emitter label for [TraceContext]. When non-null, every
+ *                       [Trigger] and [Broadcast] call wraps execution in a
+ *                       `withContext(TraceContext(emitterTag = tag))`.
  */
 class CoordinatorScope(
     val switchboard: SwitchBoard,
     private val owner: LifecycleOwner,
+    val tag: String? = null,
 ) : CoroutineScope by owner.lifecycleScope {
 
     /**
@@ -163,7 +173,13 @@ class CoordinatorScope(
      * @see SwitchBoard.broadcastState
      */
     suspend inline fun <reified O : Any> Broadcast(data: O) {
-        switchboard.broadcastState(data)
+        if (tag != null) {
+            withContext(TraceContext(emitterTag = tag)) {
+                switchboard.broadcastState(data)
+            }
+        } else {
+            switchboard.broadcastState(data)
+        }
     }
 
     /**
@@ -177,7 +193,13 @@ class CoordinatorScope(
      * @see SwitchBoard.triggerImpulse
      */
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        switchboard.triggerImpulse(event)
+        if (tag != null) {
+            withContext(TraceContext(emitterTag = tag)) {
+                switchboard.triggerImpulse(event)
+            }
+        } else {
+            switchboard.triggerImpulse(event)
+        }
     }
 
     // ── Flow Access (return the flow directly) ──────────────────────────
