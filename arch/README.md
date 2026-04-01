@@ -70,6 +70,125 @@ fun ProductScreen(appServices: AppServices) {
 
 ---
 
+## 🔍 How Synapse Compares
+
+Synapse occupies a different point in the design space than mainstream Android architectures. This section is an honest comparison — where Synapse is stronger, where others are, and what trade-offs each makes.
+
+### The core difference
+
+Most architectures organize around **who owns state** (a ViewModel, a Store, an Interactor). Synapse organizes around **how state moves** — three typed channels with middleware at every stage. Components are anonymous participants on a shared bus. This eliminates the coordination problem (how does Screen A tell Coordinator B about Event C?) but introduces a different mental model.
+
+### vs MVVM (ViewModel + StateFlow)
+
+The Google-recommended pattern. A ViewModel holds screen state, exposes it via `StateFlow`, and receives UI events as method calls. Hilt provides the ViewModel to the Composable.
+
+| Dimension | MVVM | Synapse |
+|-----------|------|---------|
+| **State ownership** | ViewModel owns screen state, survives config changes | Node owns screen state, survives config changes via `@Serializable` + `rememberSaveable` |
+| **Cross-feature communication** | Ad-hoc — inject shared repositories, use `SharedFlow` singletons, or pass callbacks through navigation | Built-in — `Broadcast`/`ListenFor` (state), `Trigger`/`ReactTo` (events) route through the SwitchBoard automatically |
+| **Middleware** | Manual — wrap repository calls, add OkHttp interceptors for network only | First-class — 6 intercept points cover all data flow (state, reactions, requests) with read/transform/full control |
+| **Data fetching** | Repository pattern — ViewModel calls repository, maps to UI state | Provider system — `DataImpulse` → `Provider` with automatic dedup, lifecycle (`Loading`/`Success`/`Error`), and KSP wiring |
+| **Testability** | Mock the repository, test ViewModel in isolation | Test through the real SwitchBoard — interceptor-based capture, no mocks. Compositional guarantee: if A works and B works, A+B works |
+| **Ecosystem** | Massive — every tutorial, library, and sample uses MVVM | Small — Synapse-specific, fewer community resources |
+| **Learning curve** | Low — most Android developers already know it | Moderate — three channels, interceptors, and the bus model require ramp-up |
+| **Boilerplate** | Low to moderate — ViewModel + UI, sometimes a repository layer | Low — `CreateContext` + `Node` replaces ViewModel entirely; KSP generates provider wiring |
+| **Static traceability** | High — IDE "find usages" on a ViewModel method shows exactly who calls it | Plugin-assisted — [Synapse Navigator](https://github.com/coreywaldon/synapse-plugin) provides gutter icons linking producers to consumers, Find Usages extended to show all channel participants, and inlay hints showing counterpart counts; without the plugin, tracing requires searching by type |
+| **IDE / tooling** | First-class — Android Studio templates, Layout Inspector ViewModel integration, profiler hooks | [Synapse Navigator](https://github.com/coreywaldon/synapse-plugin) — gutter navigation between producers/consumers, interceptor tool window, unconnected channel inspections, inlay hints, Mermaid export; no profiler integration |
+| **Process death** | `SavedStateHandle` provides key-value persistence scoped to the ViewModel | `@Serializable` + `rememberSaveable` handles Node state; Coordinator state is not automatically preserved |
+| **Hiring / onboarding** | Near-zero ramp-up — industry standard, taught in every Android course | Requires learning a new paradigm — bus model, three channels, interceptors |
+
+**MVVM's strength**: universality. Every hire knows it, every library assumes it, Google's tooling is built for it. If your app is straightforward CRUD screens with isolated data needs, MVVM is proven and sufficient.
+
+**Synapse's strength**: cross-cutting concerns and composition at scale. Auth token injection, analytics, session management, and feature coordination are first-class operations, not afterthoughts bolted onto a repository layer. The zero-coupling guarantee means adding Feature B never requires modifying Feature A.
+
+### vs MVI (Redux-style)
+
+MVI patterns (Orbit, MVIKotlin, hand-rolled reducers) use a single state object, a sealed `Intent`/`Action` type, a pure reducer function, and a side-effect system. State transitions are predictable and auditable.
+
+| Dimension | MVI | Synapse |
+|-----------|-----|---------|
+| **State model** | Single state per screen, updated exclusively through a reducer | Single state per Node, updated via `update { }` reducer — similar in practice |
+| **Intent routing** | Sealed class → `when` branch in reducer | Typed impulses → `ReactTo` / `ListenFor` registered individually |
+| **Side effects** | Framework-specific (Orbit `SideEffect`, MVIKotlin `Label`, etc.) — often the hardest part to get right | `Trigger`/`Broadcast` are the side-effect mechanism, same API as everything else |
+| **Middleware** | Varies — some MVI frameworks offer middleware, many don't | Built-in at all 6 intercept points |
+| **Multi-screen coordination** | Difficult — single store per screen means cross-screen state requires a shared store or event bus bolted on | Native — the SwitchBoard IS the shared bus, every component already participates |
+| **Predictability** | High — pure reducer, immutable state, auditable transitions | High — `update` is a reducer, state is immutable, interceptors are observable |
+| **Boilerplate** | High — Action sealed class, Reducer, SideEffect sealed class, ViewModel/Store per screen | Lower — impulse data classes replace Action sealed classes, no reducer boilerplate |
+| **Time-travel debugging** | Some implementations support it | Not built-in — use interceptors to log state transitions |
+| **Event exhaustiveness** | Compiler-enforced — sealed `when` on Intent warns about unhandled cases | Plugin-assisted — the compiler can't warn, but [Synapse Navigator](https://github.com/coreywaldon/synapse-plugin) flags unconnected channels (e.g., `Trigger<T>` with no `ReactTo<T>`) as IDE inspections |
+| **State transition auditability** | All transitions are visible in one reducer function | Transitions are spread across `ReactTo`/`ListenFor`/`Request` handlers within a Node or Coordinator |
+
+**MVI's strength**: extreme predictability. If you need an audit trail of every state transition with time-travel debugging, MVI's pure-reducer model is purpose-built for that. Mature implementations like MVIKotlin have multiplatform support and battle-tested patterns.
+
+**Synapse's strength**: MVI solves the single-screen state problem well but struggles with the multi-screen coordination problem. Synapse treats coordination as the primary concern. The three channels replace the ad-hoc event buses and shared stores that MVI apps accumulate over time.
+
+### vs RIBs (Router-Interactor-Builder)
+
+Uber's architecture. A tree of Routers (navigation), Interactors (business logic), Builders (DI), and optional Views. Each RIB is a self-contained unit with explicit parent-child relationships.
+
+| Dimension | RIBs | Synapse |
+|-----------|------|---------|
+| **Topology** | Tree — parent RIBs attach/detach children, data flows through the tree | Flat — all components communicate through the SwitchBoard, no parent-child hierarchy |
+| **Scoping** | Explicit — each RIB has its own DI scope; child lifecycle is tied to parent | Implicit — Node lifecycle is tied to Compose; Coordinator lifecycle is tied to LifecycleOwner |
+| **Communication** | Listener interfaces between parent and child (typed but coupled to tree structure) | Impulses through the bus (typed but decoupled from any structure) |
+| **Navigation** | Router-driven — Routers attach/detach child RIBs | Impulse-driven — `Trigger(NavigateTo(...))`, consumed by a navigation coordinator |
+| **Compose support** | Retrofit — RIBs predates Compose, integration exists but isn't native | Native — `CreateContext`/`Node` are Compose-first |
+| **Boilerplate** | Very high — Router + Interactor + Builder + (View) per feature | Low — `Node` or `Coordinator` per feature, no ceremony |
+| **Team scalability** | Excellent — strict boundaries prevent teams from coupling to each other's code | Excellent — zero coupling between components, impulse types are the only shared contract |
+| **Structural enforcement** | Architecture is enforced by the tree — a RIB can only talk to its parent and children, making illegal communication physically impossible | Convention-based — any component can `Trigger` any impulse type; discipline and namespacing replace structural enforcement |
+| **Lifecycle scoping** | Hierarchical — child RIB lifecycle is strictly bounded by parent; cleanup is automatic and deterministic | Flat — Node is tied to composition, Coordinator to LifecycleOwner; no built-in parent-child scope nesting |
+| **Production track record** | Proven at Uber scale (hundreds of engineers, years of production use) | Early — production-validated at smaller scale |
+
+**RIBs' strength**: battle-tested at Uber scale with hundreds of engineers. The tree structure provides clear ownership and scoping that prevents the kind of spaghetti that flat architectures risk. If you have 50+ engineers and need enforced structural boundaries, RIBs provides that.
+
+**Synapse's strength**: the flat bus eliminates the tree-navigation problem (what happens when a deeply nested RIB needs to communicate with a distant sibling?). Synapse components are structurally independent — adding a new feature never requires modifying the tree. The trade-off is that you lose explicit scoping; discipline around impulse namespacing replaces structural enforcement.
+
+### vs Circuit (Slack)
+
+Circuit separates Compose UI from business logic via a `Presenter` that produces state and consumes events. Navigation is modeled as state. It's Compose-native and multiplatform.
+
+| Dimension | Circuit | Synapse |
+|-----------|---------|---------|
+| **State ownership** | Presenter produces `CircuitUiState`, consumed by `CircuitContent` | Node holds state, updated via `update { }`, rendered in the Node body |
+| **Event model** | UI emits `CircuitUiEvent`, Presenter handles it | UI fires `Trigger(impulse)`, Node/Coordinator reacts via `ReactTo` |
+| **Navigation** | State-driven — `Navigator` pushes/pops screens as state transitions, type-safe, testable as pure state | Impulse-driven — `Trigger(NavigateTo(...))` consumed by navigation coordinator; flexible but less type-safe |
+| **Middleware / interception** | Limited — no built-in middleware layer | First-class — 6 intercept points, read/transform/full |
+| **Data fetching** | Standard — Presenter calls repositories, maps to state | Provider system — typed `DataImpulse` → `Provider` with dedup and lifecycle |
+| **Multiplatform** | Strong — designed for KMP from the start, battle-tested on iOS/Desktop | Yes — all dependencies (`LifecycleOwner`, `rememberSaveable`, coroutines) are multiplatform; not yet validated on non-Android targets |
+| **Cross-feature communication** | Manual — shared Presenters or injected dependencies | Built-in — state broadcasts and reaction impulses route through the SwitchBoard |
+| **Testing** | Presenter tests with fake UIs, snapshot testing support | Real SwitchBoard tests with interceptor capture — no mocking |
+| **UI / logic separation** | Strict — Presenter is a pure function from events to state; UI is a pure function from state to pixels; the boundary is explicit and enforceable | Blended — Node body mixes state management (`update`, `ReactTo`) with UI rendering (`Scaffold`, `Text`); business logic can live in the composable tree |
+| **Navigation testability** | High — navigation is state, so back stack assertions are standard state assertions | Lower — navigation is impulse-driven; testing requires interceptor capture of `NavigateTo` impulses |
+| **Multiplatform validation** | Proven — Slack ships on Android, iOS, and Desktop using Circuit | Untested — dependencies are multiplatform but no non-Android deployment exists yet |
+
+**Circuit's strength**: clean Presenter/UI separation with strong multiplatform support. If you're building for Android + iOS + Desktop and want a Compose-native architecture with good navigation, Circuit is compelling. Slack's real-world usage validates it at scale.
+
+**Synapse's strength**: Circuit solves the screen-level problem elegantly but doesn't address cross-feature coordination or middleware. When your app needs auth token injection across all requests, analytics interception, or session management that spans screens, those concerns need custom solutions in Circuit. In Synapse, they're first-class interceptor registrations.
+
+### Summary matrix
+
+| | MVVM | MVI | RIBs | Circuit | **Synapse** |
+|-|------|-----|------|---------|-------------|
+| **Cross-feature coordination** | Ad-hoc | Ad-hoc | Tree-based | Ad-hoc | **Bus-native** |
+| **Middleware** | None | Varies | None | None | **6 intercept points** |
+| **Data fetching abstraction** | Repository | Repository | Service | Repository | **Provider + DataState** |
+| **Compose-native** | Partial | Partial | No | Yes | **Yes** |
+| **Multiplatform** | Yes (since lifecycle 2.8) | Some | No | **Yes (proven)** | Yes (untested on non-Android) |
+| **Ecosystem maturity** | **Dominant** | Mature | Mature | Growing | Early |
+| **Boilerplate** | Low | High | Very high | Low | **Low** |
+| **Testing model** | Mock dependencies | Mock store | Mock interactor | Fake UI | **Real bus, no mocks** |
+| **Learning curve** | **Low** | Moderate | High | **Low** | Moderate |
+| **Static traceability** | **High — IDE call graph** | **High — sealed when** | High — tree structure | High — Presenter/UI boundary | Plugin-assisted — gutter nav, Find Usages, inlay hints |
+| **Event exhaustiveness** | N/A (method calls) | **Compiler-enforced** | Compiler-enforced (interfaces) | Compiler-enforced (sealed events) | Open — no compiler warning for unhandled impulses |
+| **Structural enforcement** | Moderate (DI scopes) | Low | **Strict (tree hierarchy)** | Moderate (Presenter boundary) | Convention-based (impulse namespacing) |
+| **IDE / tooling** | **First-class** | Moderate | Low | Moderate | [Synapse Navigator](https://github.com/coreywaldon/synapse-plugin) plugin |
+| **UI / logic separation** | Clear (ViewModel / Composable) | Clear (Reducer / UI) | Clear (Interactor / View) | **Strict (Presenter / UI)** | Blended (Node body mixes both) |
+| **Production track record** | **Ubiquitous** | Widespread | **Uber-scale** | Slack-scale | Early |
+
+No architecture is universally superior. The right choice depends on your team's size, your app's coordination complexity, your multiplatform needs, and how much you value convention vs. control. Synapse is built for applications where **cross-cutting concerns and inter-feature coordination** are the dominant complexity — not just rendering screens from data.
+
+---
+
 ## 🔀 Three Channels
 
 | Channel      | Replay | Produce            | Consume                     | Purpose                                                              |
@@ -348,7 +467,7 @@ Handler overloads run with `CoordinatorScope` as the receiver, giving direct acc
 
 ## 🔗 Interceptors
 
-Composable middleware (similar to OkHttp interceptors) registered at any of 6 intercept points.
+Chainable middleware (similar to OkHttp interceptors) registered at any of 6 intercept points.
 
 ### Factory methods
 
@@ -679,12 +798,20 @@ fun CheckoutScreen(appServices: AppServices) {
 // Child composable as a ContextScope extension — gives bus access without prop drilling
 @Composable
 fun ContextScope<AppServices>.CheckoutContent(state: CheckoutState) {
-    // Local state change — use update directly, no impulse needed
-    AddressList(
-        addresses = state.addresses.dataOrNull.orEmpty(),
-        selected = state.selectedAddress,
-        onSelect = { addr -> update { it.copy(selectedAddress = addr) } },
-    )
+    val addresses = state.addresses.dataOrNull.orEmpty()
+
+    // Local state — update directly from click handler, no impulse needed
+    LazyColumn {
+        items(addresses) { addr ->
+            AddressRow(
+                address = addr,
+                isSelected = addr == state.selectedAddress,
+                modifier = Modifier.clickable {
+                    update { it.copy(selectedAddress = addr) }
+                },
+            )
+        }
+    }
 
     Button(
         // Cross-component action — fire an impulse
@@ -698,9 +825,9 @@ fun ContextScope<AppServices>.CheckoutContent(state: CheckoutState) {
 }
 ```
 
-**No callback threading.** Child composables should never receive `onSomething` lambdas that thread state changes back up to a parent Node. Instead, children fire impulses through the bus via `Trigger()`, and the Node reacts to them with `ReactTo`. This keeps components decoupled — they communicate through typed impulses, not callback chains.
+**No callback threading.** Bus-aware child composables (ContextScope extensions) should never receive `onSomething` lambdas that thread state changes back to a parent Node. Instead, children fire impulses through the bus via `Trigger()`, and the Node reacts to them with `ReactTo`. This keeps components decoupled — they communicate through typed impulses, not callback chains.
 
-Passing **read-only display data** as parameters is fine — the anti-pattern is passing **callback lambdas** that modify parent state.
+Passing **read-only display data** as parameters is fine. Passing lambdas to **pure UI leaf components** (things like `AddressRow`, `Button` — not ContextScope extensions) is also fine, since they don't participate in the bus.
 
 ```kotlin
 // Anti-pattern: callback threading
@@ -908,7 +1035,7 @@ class FetchOrderDetailsProvider @Inject constructor(
         // Nested request for shipping info
         val shipping = Request<ShippingInfo, FetchShipping>(
             FetchShipping(order.trackingId)
-        ).first { it is DataState.Success }.data
+        ).filterIsInstance<DataState.Success<ShippingInfo>>().first().data
         emit(OrderDetails(order, shipping))
     }
 }
