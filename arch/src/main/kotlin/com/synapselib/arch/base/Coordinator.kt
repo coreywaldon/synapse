@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.collections.mutableListOf
 
 /**
  * Creates a lifecycle-aware [CoordinatorScope] and runs [block] with it as the
@@ -72,6 +73,7 @@ fun Coordinator(
  * | **Listen (state)** | [ListenFor]`()` → `SharedFlow<O>` | [ListenFor]`{ handler }` → [Job] |
  * | **Listen (reaction)** | [ReactTo]`()` → `SharedFlow<A>` | [ReactTo]`{ handler }` → [Job] |
  * | **Request** | [Request]`(params)` → `SharedFlow<Need>` | [Request]`(params) { callback }` → [Job] |
+ * | **Lifecycle hooks** | — | [onCreate], [onStart], [onResume], [onPause], [onStop], [onDestroy] |
  *
  * ## CoroutineScope Delegation
  *
@@ -94,10 +96,24 @@ fun Coordinator(
  * You may also call [dispose] manually at any time if earlier cleanup is
  * needed.
  *
+ * ### Lifecycle Hooks
+ *
+ * Register callbacks for any [Lifecycle.Event] using the convenience
+ * methods [onCreate], [onStart], [onResume], [onPause], [onStop], and
+ * [onDestroy]. Callbacks are invoked in registration order when the
+ * [LifecycleOwner] reaches the corresponding state:
+ *
+ * ```kotlin
+ * val coordinator = Coordinator(switchboard, viewLifecycleOwner) {
+ *     onStart { launch { Broadcast(SessionActive) } }
+ *     onStop  { launch { Broadcast(SessionInactive) } }
+ * }
+ * ```
+ *
  * [dispose] will:
  * 1. Cancel the backing coroutine job (and all child jobs/listeners).
  * 2. Unregister all interceptors added via [Intercept].
- * 3. Clear the internal registration list.
+ * 3. Clear the internal registration and lifecycle-callback lists.
  * 4. Remove the lifecycle observer.
  *
  * @param switchboard    the [SwitchBoard] this scope communicates through.
@@ -120,10 +136,48 @@ class CoordinatorScope(
     internal val registrations = mutableListOf<Registration>()
 
     /**
-     * Lifecycle observer that triggers [dispose] on ON_DESTROY.
+     * Registered lifecycle-event callbacks, keyed by the [Lifecycle.Event] they
+     * respond to. Callbacks are appended via [addLifecycleEventRegistration] and
+     * invoked in registration order when the corresponding event fires.
+     */
+    @PublishedApi
+    internal val lifecycleRegistrations = mutableMapOf<Lifecycle.Event, MutableList<() -> Unit>>()
+
+    /**
+     * Dispatches all callbacks registered for [event] via
+     * [addLifecycleEventRegistration], in registration order.
+     */
+    private fun dispatchLifecycleCallbacks(event: Lifecycle.Event) {
+        lifecycleRegistrations[event]?.forEach { it.invoke() }
+    }
+
+    /**
+     * Lifecycle observer that dispatches registered callbacks for each
+     * event and triggers [dispose] on [Lifecycle.Event.ON_DESTROY].
      */
     private val lifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onCreate(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_CREATE)
+        }
+
+        override fun onStart(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_START)
+        }
+
+        override fun onResume(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_RESUME)
+        }
+
+        override fun onPause(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_PAUSE)
+        }
+
+        override fun onStop(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_STOP)
+        }
+
         override fun onDestroy(owner: LifecycleOwner) {
+            dispatchLifecycleCallbacks(Lifecycle.Event.ON_DESTROY)
             dispose()
         }
     }
@@ -344,6 +398,99 @@ class CoordinatorScope(
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     /**
+     * Appends a [callback] that will be invoked when the [LifecycleOwner]
+     * reaches [event]. Multiple callbacks for the same event are executed
+     * in the order they were registered.
+     *
+     * Prefer the convenience wrappers ([onCreate], [onStart], [onResume],
+     * [onPause], [onStop], [onDestroy]) over calling this directly.
+     *
+     * @param event    the [Lifecycle.Event] to observe.
+     * @param callback the action to run when the event fires.
+     */
+    @PublishedApi
+    internal fun addLifecycleEventRegistration(event: Lifecycle.Event, callback: () -> Unit) {
+        lifecycleRegistrations.computeIfAbsent(event) { mutableListOf() }.add(callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_CREATE].
+     *
+     * @param callback the action to execute on create.
+     */
+    fun onCreate(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_CREATE, callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_START].
+     *
+     * ```kotlin
+     * Coordinator(switchboard, lifecycleOwner) {
+     *     onStart { launch { Broadcast(SessionActive) } }
+     * }
+     * ```
+     *
+     * @param callback the action to execute on start.
+     */
+    fun onStart(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_START, callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_RESUME].
+     *
+     * @param callback the action to execute on resume.
+     */
+    fun onResume(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_RESUME, callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_PAUSE].
+     *
+     * @param callback the action to execute on pause.
+     */
+    fun onPause(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_PAUSE, callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_STOP]. Useful for releasing resources that
+     * should only be held while the owner is visible.
+     *
+     * ```kotlin
+     * Coordinator(switchboard, lifecycleOwner) {
+     *     onStop { launch { Broadcast(SessionInactive) } }
+     * }
+     * ```
+     *
+     * @param callback the action to execute on stop.
+     */
+    fun onStop(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_STOP, callback)
+    }
+
+    /**
+     * Registers a [callback] to run when the [LifecycleOwner] reaches
+     * [Lifecycle.Event.ON_DESTROY].
+     *
+     * Note: The [CoordinatorScope] already auto-[disposes][dispose] on
+     * ON_DESTROY. Use this for additional cleanup that goes beyond what
+     * [dispose] handles (e.g., closing external resources).
+     *
+     * @param callback the action to execute on destroy.
+     */
+    fun onDestroy(callback: () -> Unit) {
+        addLifecycleEventRegistration(Lifecycle.Event.ON_DESTROY, callback)
+    }
+
+    /**
      * Tears down this coordinator, releasing all resources.
      *
      * Specifically:
@@ -367,6 +514,7 @@ class CoordinatorScope(
         coroutineContext[Job]?.cancel()
         registrations.forEach { it.unregister() }
         registrations.clear()
+        lifecycleRegistrations.clear()
         owner.lifecycle.removeObserver(lifecycleObserver)
     }
 }

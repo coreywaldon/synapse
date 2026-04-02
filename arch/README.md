@@ -434,6 +434,26 @@ Optional `tag` parameter enables [tracing](#-observability):
 val coordinator = Coordinator(switchboard, lifecycleOwner, tag = "AuthCoordinator") { ... }
 ```
 
+### Lifecycle Hooks
+
+Register callbacks for any Android lifecycle event directly inside the coordinator block:
+
+```kotlin
+Coordinator(switchboard, lifecycleOwner) {
+    onStart {
+        launch { Broadcast(SessionActive) }
+    }
+
+    onStop {
+        launch { Broadcast(SessionInactive) }
+    }
+}
+```
+
+Available hooks: `onCreate`, `onStart`, `onResume`, `onPause`, `onStop`, `onDestroy`.
+
+Multiple callbacks for the same event execute in registration order. All callbacks are cleared on `dispose()`.
+
 ### Flow vs Handler overloads
 
 Every consumption method has two overloads:
@@ -851,41 +871,42 @@ Coordinators handle business logic that spans multiple screens or lives beyond a
 - **Multi-screen orchestration**: Cart management, onboarding flows
 
 ```kotlin
-// Auth coordinator — injected token into all outgoing TokenBearer impulses
+// Auth coordinator — injects token into all outgoing TokenBearer impulses
 class AuthCoordinator(
     private val authApi: AuthApi,
+    private val switchboard: SwitchBoard,
     private val owner: LifecycleOwner,
 ) {
-    private lateinit var scope: CoordinatorScope
+    private val scope = Coordinator(switchboard, owner, tag = "AuthCoordinator") {
+        // Inject auth token into all outgoing requests
+        Intercept<TokenBearer>(
+            point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
+            interceptor = Interceptor.transform { impulse ->
+                impulse.apply { token = currentToken }
+            },
+        )
 
-    fun initialize(switchboard: SwitchBoard) {
-        scope = Coordinator(switchboard, owner, tag = "AuthCoordinator") {
-            // Inject auth token into all outgoing requests
-            Intercept<TokenBearer>(
-                point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
-                interceptor = Interceptor.transform { impulse ->
-                    impulse.apply { token = currentToken }
-                },
-            )
-
-            // Handle login
-            ReactTo<LoginRequested> { request ->
-                launch {
-                    val result = authApi.login(request.email, request.password)
-                    Broadcast(SessionState.Authenticated(result.user))
-                    Trigger(NavigateTo("home"))
-                }
-            }
-
-            // Handle logout
-            ReactTo<LogoutRequested> {
-                launch {
-                    authApi.logout()
-                    Broadcast(SessionState.LoggedOut)
-                    Trigger(NavigateTo("login"))
-                }
+        // Handle login
+        ReactTo<LoginRequested> { request ->
+            launch {
+                val result = authApi.login(request.email, request.password)
+                Broadcast(SessionState.Authenticated(result.user))
+                Trigger(NavigateTo("home"))
             }
         }
+
+        // Handle logout
+        ReactTo<LogoutRequested> {
+            launch {
+                authApi.logout()
+                Broadcast(SessionState.LoggedOut)
+                Trigger(NavigateTo("login"))
+            }
+        }
+
+        // Lifecycle hooks
+        onStart { launch { Broadcast(SessionState.Active) } }
+        onStop  { launch { Broadcast(SessionState.Inactive) } }
     }
 }
 ```

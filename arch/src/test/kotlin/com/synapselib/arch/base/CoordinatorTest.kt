@@ -661,6 +661,177 @@ class CoordinatorScopeTest {
     }
 
     // ══════════════════════════════════════════════════════════════════
+    // Lifecycle hooks
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `onStart callback fires on ON_START`() = runTest {
+        val owner = object : LifecycleOwner {
+            val registry = LifecycleRegistry(this)
+            override val lifecycle: Lifecycle get() = registry
+        }
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onStart { called.incrementAndGet() }
+
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `onStop callback fires on ON_STOP`() = runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onStop { called.incrementAndGet() }
+
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `onResume callback fires on ON_RESUME`() = runTest {
+        val owner = object : LifecycleOwner {
+            val registry = LifecycleRegistry(this)
+            override val lifecycle: Lifecycle get() = registry
+        }
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onResume { called.incrementAndGet() }
+
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `onPause callback fires on ON_PAUSE`() = runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onPause { called.incrementAndGet() }
+
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `onCreate callback fires on ON_CREATE`() = runTest {
+        val owner = object : LifecycleOwner {
+            val registry = LifecycleRegistry(this)
+            override val lifecycle: Lifecycle get() = registry
+        }
+
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onCreate { called.incrementAndGet() }
+
+        assertEquals(0, called.get())
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `onDestroy callback fires before dispose`() = runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+        val called = AtomicInteger(0)
+        coord.onDestroy { called.incrementAndGet() }
+
+        owner.destroy()
+        assertEquals(1, called.get())
+    }
+
+    @Test
+    fun `multiple callbacks for the same event fire in registration order`() = runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+        val order = mutableListOf<String>()
+
+        coord.onStop { order.add("first") }
+        coord.onStop { order.add("second") }
+        coord.onStop { order.add("third") }
+
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+
+        assertEquals(listOf("first", "second", "third"), order)
+    }
+
+    @Test
+    fun `lifecycle callbacks are cleared on dispose`() = runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+        coord.onStop { }
+        coord.onStart { }
+
+        assertTrue(coord.lifecycleRegistrations.isNotEmpty())
+        coord.dispose()
+        assertTrue(coord.lifecycleRegistrations.isEmpty())
+    }
+
+    @Test
+    fun `callbacks for different events fire independently`() = runTest {
+        val owner = object : LifecycleOwner {
+            val registry = LifecycleRegistry(this)
+            override val lifecycle: Lifecycle get() = registry
+        }
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+
+        val coord = CoordinatorScope(switchBoard, owner)
+        val startCalled = AtomicInteger(0)
+        val resumeCalled = AtomicInteger(0)
+
+        coord.onStart { startCalled.incrementAndGet() }
+        coord.onResume { resumeCalled.incrementAndGet() }
+
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        assertEquals(1, startCalled.get())
+        assertEquals(0, resumeCalled.get())
+
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        assertEquals(1, startCalled.get())
+        assertEquals(1, resumeCalled.get())
+    }
+
+    @Test
+    fun `lifecycle hooks work through Coordinator factory`() = runTest {
+        val owner = object : LifecycleOwner {
+            val registry = LifecycleRegistry(this)
+            override val lifecycle: Lifecycle get() = registry
+        }
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+
+        val startCalled = AtomicInteger(0)
+        val stopCalled = AtomicInteger(0)
+
+        Coordinator(switchBoard, owner) {
+            onStart { startCalled.incrementAndGet() }
+            onStop { stopCalled.incrementAndGet() }
+        }
+
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        assertEquals(1, startCalled.get())
+        assertEquals(0, stopCalled.get())
+
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        assertEquals(1, startCalled.get())
+        assertEquals(1, stopCalled.get())
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // Broadcast edge cases
     // ══════════════════════════════════════════════════════════════════
 
