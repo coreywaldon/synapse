@@ -19,7 +19,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch:1.0.6")
+    implementation("com.synapselib:arch:1.0.9")
 }
 ```
 
@@ -1303,6 +1303,120 @@ Each interceptor receives the data and a `Chain` handle. It can:
 - **Short-circuit**: return a value without calling `proceed` — skip remaining interceptors
 
 Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result.
+
+---
+
+## Performance
+
+Synapse has been extensively benchmarked at every layer — SwitchBoard throughput (JMH on JVM), interceptor pipeline scaling, provider dedup, coordinator lifecycle, and Node composition cost (on-device Android benchmarks). The results below are from v1.0.9.
+
+### SwitchBoard overhead
+
+| Operation | Synapse | Bare Flow | Overhead |
+|-----------|---------|-----------|----------|
+| State broadcast + collect | 0.759 µs | 0.553 µs | 1.37x |
+| Impulse trigger (end-to-end) | 0.863 µs | — | — |
+| Request/response (via Provider) | 4.458 µs | — | — |
+
+The SwitchBoard adds ~200 ns over raw `SharedFlow` for state broadcast — the cost of type-based routing and the interceptor pipeline check. Impulse delivery and request/response are similarly in the single-digit microsecond range.
+
+### Fan-out scaling
+
+| Collectors | Throughput (ops/µs) | Scaling |
+|------------|---------------------|---------|
+| 1 | 0.792 | baseline |
+| 5 | 0.151 | linear |
+| 10 | 0.075 | linear |
+| 50 | 0.015 | linear |
+
+Fan-out scales linearly with collector count. No degradation or contention effects.
+
+### Interceptor pipeline
+
+| Pipeline | Cost per emission |
+|----------|-------------------|
+| 0 interceptors | baseline |
+| 1 read-only | +20 ns |
+| 1 transform | +20 ns |
+| 5 mixed | +100 ns |
+| 10 mixed | +200 ns |
+
+Each interceptor adds ~20 ns. Even a pipeline of 10 interceptors adds only 200 ns total — negligible relative to any real business logic.
+
+### Compose Node composition (on-device, Pixel 9 Pro Fold)
+
+Base cost of composing a single Node (CreateContext + Node + state init): **~380 µs**.
+
+**Sibling Node scaling (flat, in one CreateContext):**
+
+| Sibling count | Median | Per-Node cost |
+|---------------|--------|---------------|
+| 5 | 490 µs | baseline |
+| 10 | 610 µs | ~24 µs |
+| 20 | 830 µs | ~22 µs |
+| 50 | 1.48 ms | ~22 µs |
+| 100 | 2.48 ms | ~21 µs |
+| 200 | 4.54 ms | ~21 µs |
+
+**Nested Node scaling (each level wraps the next):**
+
+| Depth | Median | Per-level cost |
+|-------|--------|---------------|
+| 1 | 400 µs | baseline |
+| 5 | 500 µs | ~25 µs |
+| 10 | 540 µs | ~16 µs |
+| 20 | 710 µs | ~16 µs |
+| 50 | 1.27 ms | ~18 µs |
+| 100 | 2.57 ms | ~22 µs |
+
+Scaling is linear in both dimensions at ~20 µs per additional Node. 200 sibling Nodes compose in 4.5 ms — well under a single 16 ms frame.
+
+**Composition variants** (all within noise of each other):
+
+| Variant | Median |
+|---------|--------|
+| Minimal Node | ~380 µs |
+| Non-serializable state | ~380 µs |
+| FullyWired (ListenFor + ReactTo + Intercept) | ~447 µs |
+| With interceptor registration | ~400 µs |
+| Recomposition via update{} | ~380 µs |
+
+Adding ListenFor, ReactTo, and Intercept to a Node adds ~65 µs. Serializable vs non-serializable state is within noise — the serializer lookup is cached.
+
+**Requesting Nodes (Provider dedup under composition):**
+
+| Count | Median | vs plain siblings |
+|-------|--------|-------------------|
+| 5 | 694 µs | +33% |
+| 10 | 845 µs | +14% |
+| 20 | 1.29 ms | +64% |
+| 50 | 2.36 ms | +69% |
+
+Multiple Nodes issuing the same `DataImpulse` share one in-flight provider job (structural equality dedup). The Request overhead is ~35 µs per Node on top of the base composition cost.
+
+**Derived initial state (parent state change cascading to children):**
+
+| Children | Median | vs static initialState |
+|----------|--------|------------------------|
+| 5 | ~540 µs | +8% |
+| 10 | ~740 µs | +6% |
+| 20 | ~940 µs | +13% |
+| 50 | ~1.59 ms | +8% |
+
+Compose correctly scopes recomposition — changing a parent's state only recomposes children whose inputs actually changed. No recomposition avalanche. Even in a nested chain where every level derives from the one above, the overhead is ~10-20% over static initial state.
+
+### Concurrent traffic
+
+Under realistic mixed workloads (simultaneous state broadcasts, impulse triggers, and data requests across multiple types), SwitchBoard throughput remains flat. Per-type flow isolation means different types don't contend with each other.
+
+### Summary
+
+- ~200 ns overhead per SwitchBoard operation vs bare flows
+- ~20 ns per interceptor in the pipeline
+- ~20 µs per Node in Compose composition
+- Linear scaling in every dimension tested — no cliffs, no superlinear growth
+- Provider dedup works under composition load
+- Compose recomposition is correctly scoped through the Node tree
 
 ---
 
