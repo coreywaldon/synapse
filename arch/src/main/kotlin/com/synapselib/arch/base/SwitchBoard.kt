@@ -64,7 +64,23 @@ enum class Channel { REQUEST, STATE, REACTION }
  * @property direction whether the interception occurs on the producing
  *                     ([Direction.UPSTREAM]) or consuming ([Direction.DOWNSTREAM]) side.
  */
-data class InterceptPoint(val channel: Channel, val direction: Direction)
+data class InterceptPoint(val channel: Channel, val direction: Direction) {
+    /**
+     * Pre-allocated constants for all six possible intercept points.
+     *
+     * Since there are only 6 combinations of [Channel] × [Direction], reusing
+     * these avoids allocating a new data class instance on every broadcast,
+     * trigger, or request.
+     */
+    companion object {
+        val STATE_UPSTREAM = InterceptPoint(Channel.STATE, Direction.UPSTREAM)
+        val STATE_DOWNSTREAM = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM)
+        val REACTION_UPSTREAM = InterceptPoint(Channel.REACTION, Direction.UPSTREAM)
+        val REACTION_DOWNSTREAM = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM)
+        val REQUEST_UPSTREAM = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM)
+        val REQUEST_DOWNSTREAM = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM)
+    }
+}
 
 /**
  * Central message bus that coordinates **requests**, **state**, and **reactions**
@@ -393,14 +409,12 @@ class DefaultSwitchBoard @Inject constructor(
     // ── Produce (Upstream) ──────────────────────────────────────────────
 
     override suspend fun <T : Any> broadcastState(clazz: KClass<T>, data: T) {
-        val upstream = InterceptPoint(Channel.STATE, Direction.UPSTREAM)
-        val processed = processAndLog(upstream, clazz, data)
+        val processed = processAndLog(InterceptPoint.STATE_UPSTREAM, clazz, data)
         mutableStateFlow(clazz).emit(processed)
     }
 
     override suspend fun <T : Any> triggerImpulse(clazz: KClass<T>, data: T) {
-        val upstream = InterceptPoint(Channel.REACTION, Direction.UPSTREAM)
-        val processed = processAndLog(upstream, clazz, data)
+        val processed = processAndLog(InterceptPoint.REACTION_UPSTREAM, clazz, data)
         mutableReactionFlow(clazz).emit(processed)
     }
 
@@ -409,8 +423,7 @@ class DefaultSwitchBoard @Inject constructor(
         needType: KClass<Need>,
         impulse: I,
     ): Flow<DataState<Need>> = flow {
-        val upstream = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM)
-        val processedImpulse = processAndLog(upstream, impulseType, impulse)
+        val processedImpulse = processAndLog(InterceptPoint.REQUEST_UPSTREAM, impulseType, impulse)
 
         val providerFlow = try {
             providerManager.request(
@@ -424,18 +437,17 @@ class DefaultSwitchBoard @Inject constructor(
             return@flow
         }
 
-        val downstream = InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM)
         providerFlow.collect { state ->
             when (state) {
                 is DataState.Success<Need> -> {
-                    val interceptedData = processAndLog(downstream, needType, state.data)
+                    val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state.data)
                     emit(DataState.Success(interceptedData))
                 }
 
                 is DataState.Error<Need> -> {
                     val staleData = state.staleData
                     if (staleData != null) {
-                        val interceptedData = processAndLog(downstream, needType, staleData)
+                        val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, staleData)
                         emit(DataState.Error(state.cause, interceptedData))
                     } else {
                         emit(DataState.Error(state.cause, null))
@@ -443,7 +455,7 @@ class DefaultSwitchBoard @Inject constructor(
                 }
 
                 else -> {
-                    processAndLog(downstream, needType, state)
+                    processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state)
                     emit(state)
                 }
             }
@@ -454,9 +466,8 @@ class DefaultSwitchBoard @Inject constructor(
 
     override fun <T : Any> stateFlow(clazz: KClass<T>): SharedFlow<T> {
         val shared = downstreamStateFlows.computeIfAbsent(clazz) {
-            val downstream = InterceptPoint(Channel.STATE, Direction.DOWNSTREAM)
             mutableStateFlow(clazz)
-                .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
+                .map { processAndLog(InterceptPoint.STATE_DOWNSTREAM, clazz, clazz.java.cast(it)) }
                 .shareIn(scope, sharingStarted, replay = 1)
         }
         return TypedSharedFlow(shared, clazz)
@@ -464,9 +475,8 @@ class DefaultSwitchBoard @Inject constructor(
 
     override fun <T : Any> impulseFlow(clazz: KClass<T>): SharedFlow<T> {
         val shared = downstreamImpulseFlows.computeIfAbsent(clazz) {
-            val downstream = InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM)
             mutableReactionFlow(clazz)
-                .map { processAndLog(downstream, clazz, clazz.java.cast(it)) }
+                .map { processAndLog(InterceptPoint.REACTION_DOWNSTREAM, clazz, clazz.java.cast(it)) }
                 .shareIn(scope, sharingStarted, replay = 0)
         }
         return TypedSharedFlow(shared, clazz)
@@ -535,9 +545,14 @@ class DefaultSwitchBoard @Inject constructor(
     private suspend fun <T : Any> processAndLog(point: InterceptPoint, clazz: KClass<out T>, data: T): T {
         val processed = pipelineFor(point).applyInterceptors(clazz, data)
         globalLogger.get()?.invoke(point, clazz, processed)
-        val trace = currentCoroutineContext()[TraceContext]
-        if (trace != null) {
-            traceListener.get()?.invoke(trace, point, clazz, processed)
+        // Guard: only call currentCoroutineContext() when a trace listener is
+        // actually registered. This avoids the suspend intrinsic overhead on
+        // every emission in the common case where tracing is disabled.
+        if (traceListener.get() != null) {
+            val trace = currentCoroutineContext()[TraceContext]
+            if (trace != null) {
+                traceListener.get()?.invoke(trace, point, clazz, processed)
+            }
         }
         return processed
     }

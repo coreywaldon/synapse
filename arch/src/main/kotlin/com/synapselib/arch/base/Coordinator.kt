@@ -7,6 +7,7 @@ import androidx.lifecycle.lifecycleScope
 import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -126,7 +127,16 @@ class CoordinatorScope(
     val switchboard: SwitchBoard,
     private val owner: LifecycleOwner,
     val tag: String? = null,
-) : CoroutineScope by owner.lifecycleScope {
+) : CoroutineScope {
+
+    /**
+     * Isolated child job that scopes all coordinator coroutines. Using a
+     * [SupervisorJob] parented to the lifecycle scope's job means [dispose]
+     * only cancels the coordinator's own work — not the entire lifecycle scope.
+     * This is important when [dispose] is called manually before ON_DESTROY.
+     */
+    private val job = SupervisorJob(owner.lifecycleScope.coroutineContext[Job])
+    override val coroutineContext = owner.lifecycleScope.coroutineContext + job
 
     /**
      * Accumulated interceptor registrations that will be
@@ -511,7 +521,7 @@ class CoordinatorScope(
      * This method is idempotent; calling it multiple times is safe.
      */
     fun dispose() {
-        coroutineContext[Job]?.cancel()
+        job.cancel()
         registrations.forEach { it.unregister() }
         registrations.clear()
         lifecycleRegistrations.clear()

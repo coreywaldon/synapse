@@ -21,6 +21,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNotSame
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
@@ -949,5 +950,61 @@ class NodeScopeTest {
 
         assertEquals(listOf(BoxedBroadcast("hello")), receivedStrings)
         assertEquals(listOf(BoxedBroadcast(42)), receivedInts)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // serializerOrNull caching
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `serializerOrNull returns serializer for Serializable types`() {
+        // TestState is @Serializable in this test file (if applicable),
+        // but String and Int are always serializable via kotlinx.serialization builtins
+        val stringSerializer = serializerOrNull<String>()
+        assertNotNull(stringSerializer)
+    }
+
+    @Test
+    fun `serializerOrNull returns null for non-Serializable types`() {
+        // A plain data class without @Serializable
+        data class NotSerializable(val x: Int)
+
+        val result = serializerOrNull<NotSerializable>()
+        assertNull(result)
+    }
+
+    @Test
+    fun `serializerOrNull caches results across repeated calls`() {
+        // Clear the cache to ensure a clean test
+        serializerCache.clear()
+
+        // First call — may trigger try/catch
+        val first = serializerOrNull<String>()
+        assertNotNull(first)
+
+        // Verify it's now cached
+        assertTrue(serializerCache.containsKey(String::class))
+
+        // Second call — should return cached value, identical reference
+        val second = serializerOrNull<String>()
+        assertSame(first, second)
+    }
+
+    @Test
+    fun `serializerOrNull caches NoSerializer for non-Serializable types`() {
+        data class AlsoNotSerializable(val y: String)
+
+        serializerCache.clear()
+
+        val first = serializerOrNull<AlsoNotSerializable>()
+        assertNull(first)
+
+        // Sentinel should be cached
+        assertTrue(serializerCache.containsKey(AlsoNotSerializable::class))
+        assertSame(NoSerializer, serializerCache[AlsoNotSerializable::class])
+
+        // Repeated call still returns null without re-throwing
+        val second = serializerOrNull<AlsoNotSerializable>()
+        assertNull(second)
     }
 }

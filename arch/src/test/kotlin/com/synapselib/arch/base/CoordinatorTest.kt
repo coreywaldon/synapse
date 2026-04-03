@@ -3,6 +3,7 @@ package com.synapselib.arch.base
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.lifecycleScope
 import com.synapselib.arch.base.provider.Provider
 import com.synapselib.arch.base.provider.ProviderRegistry
 import com.synapselib.arch.base.provider.ProviderScope
@@ -12,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -580,7 +582,7 @@ class CoordinatorScopeTest {
 
         coord.dispose()
 
-        // After dispose, the backing job is cancelled so new triggers won't be received
+        // After dispose, the backing job is canceled so new triggers won't be received
         // by the handler (though the switchboard itself still works)
         val externalReceived = mutableListOf<TestImpulse>()
         val externalJob = launch {
@@ -1157,7 +1159,7 @@ class CoordinatorScopeTest {
 
         coordinatorScope.dispose()
         // Broadcast is a suspend on switchboard directly, so it still works
-        // even though the coordinator's job is cancelled
+        // even though the coordinator's job is canceled
         switchBoard.broadcastState(TestBroadcast("post-dispose"))
         testScheduler.advanceUntilIdle()
         job.cancel()
@@ -1370,5 +1372,136 @@ class CoordinatorScopeTest {
         job.cancel()
 
         assertEquals(listOf(TestImpulse("from-node")), received)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // SupervisorJob isolation
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `dispose does not cancel the lifecycle owner's scope`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+
+        // Launch a job on the owner's lifecycle scope directly
+        var lifecycleJobCompleted = false
+        val lifecycleJob = owner.lifecycle.let {
+            CoroutineScope(owner.lifecycleScope.coroutineContext).launch {
+                delay(100)
+                lifecycleJobCompleted = true
+            }
+        }
+
+        // Dispose the coordinator — should NOT cancel the lifecycle scope
+        coord.dispose()
+        testScheduler.advanceUntilIdle()
+
+        assertTrue(lifecycleJobCompleted, "Lifecycle scope job should still complete after coordinator dispose")
+        lifecycleJob.cancel()
+    }
+
+    @Test
+    fun `coordinator child jobs are cancelled on dispose but lifecycle scope survives`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner)
+
+        val coordReceived = mutableListOf<TestImpulse>()
+        coord.ReactTo<TestImpulse> { coordReceived.add(it) }
+
+        // Verify coordinator works before dispose
+        coord.Trigger(TestImpulse("before"))
+        testScheduler.advanceUntilIdle()
+        assertEquals(1, coordReceived.size)
+
+        coord.dispose()
+
+        // Coordinator's listener is dead, but the switchboard still works
+        val externalReceived = mutableListOf<TestImpulse>()
+        val externalJob = launch {
+            switchBoard.impulseFlow(TestImpulse::class).collect { externalReceived.add(it) }
+        }
+        switchBoard.triggerImpulse(TestImpulse::class, TestImpulse("after"))
+        testScheduler.advanceUntilIdle()
+        externalJob.cancel()
+
+        assertEquals(1, coordReceived.size) // No new items after dispose
+        assertEquals(1, externalReceived.size) // External listener still works
+    }
+
+    @Test
+    fun `multiple coordinators on same owner are independent`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord1 = CoordinatorScope(switchBoard, owner)
+        val coord2 = CoordinatorScope(switchBoard, owner)
+
+        val received1 = mutableListOf<TestImpulse>()
+        val received2 = mutableListOf<TestImpulse>()
+        coord1.ReactTo<TestImpulse> { received1.add(it) }
+        coord2.ReactTo<TestImpulse> { received2.add(it) }
+
+        coord1.Trigger(TestImpulse("shared"))
+        testScheduler.advanceUntilIdle()
+
+        // Both receive the impulse
+        assertEquals(1, received1.size)
+        assertEquals(1, received2.size)
+
+        // Disposing coord1 does not affect coord2
+        coord1.dispose()
+
+        coord2.Trigger(TestImpulse("after-dispose"))
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(1, received1.size)  // coord1 stopped
+        assertEquals(2, received2.size)  // coord2 still running
+
+        coord2.dispose()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // TraceContext with monotonic trace IDs
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `TraceContext generates unique monotonic trace IDs`() {
+        val ids = (1..100).map { TraceContext.nextTraceId() }
+        // All unique
+        assertEquals(ids.size, ids.toSet().size)
+        // All start with "trace-"
+        assertTrue(ids.all { it.startsWith("trace-") })
+    }
+
+    @Test
+    fun `tagged coordinator Broadcast includes TraceContext`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner, tag = "MyCoordinator")
+
+        val traces = mutableListOf<String>()
+        switchBoard.setTraceListener { trace, _, _, _ ->
+            traces.add(trace.emitterTag ?: "none")
+        }
+
+        coord.Broadcast(TestBroadcast("data"))
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(listOf("MyCoordinator"), traces)
+        coord.dispose()
+    }
+
+    @Test
+    fun `untagged coordinator Broadcast does not include TraceContext`() = testScope.runTest {
+        val owner = TestLifecycleOwner()
+        val coord = CoordinatorScope(switchBoard, owner) // no tag
+
+        val traces = mutableListOf<String>()
+        switchBoard.setTraceListener { trace, _, _, _ ->
+            traces.add(trace.emitterTag ?: "none")
+        }
+
+        coord.Broadcast(TestBroadcast("data"))
+        testScheduler.advanceUntilIdle()
+
+        assertTrue(traces.isEmpty(), "Trace listener should not fire without a tag")
+        coord.dispose()
     }
 }

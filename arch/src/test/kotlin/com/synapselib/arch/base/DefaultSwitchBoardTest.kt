@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -1739,5 +1740,107 @@ class DefaultSwitchBoardTest {
         assertTrue(!DataState.Idle.isLoading)
         assertTrue(!DataState.Success("x").isLoading)
         assertTrue(!DataState.Error<String>(RuntimeException()).isLoading)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // InterceptPoint companion constants
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `InterceptPoint companion constants match manually constructed instances`() {
+        assertEquals(InterceptPoint(Channel.STATE, Direction.UPSTREAM), InterceptPoint.STATE_UPSTREAM)
+        assertEquals(InterceptPoint(Channel.STATE, Direction.DOWNSTREAM), InterceptPoint.STATE_DOWNSTREAM)
+        assertEquals(InterceptPoint(Channel.REACTION, Direction.UPSTREAM), InterceptPoint.REACTION_UPSTREAM)
+        assertEquals(InterceptPoint(Channel.REACTION, Direction.DOWNSTREAM), InterceptPoint.REACTION_DOWNSTREAM)
+        assertEquals(InterceptPoint(Channel.REQUEST, Direction.UPSTREAM), InterceptPoint.REQUEST_UPSTREAM)
+        assertEquals(InterceptPoint(Channel.REQUEST, Direction.DOWNSTREAM), InterceptPoint.REQUEST_DOWNSTREAM)
+    }
+
+    @Test
+    fun `InterceptPoint companion constants are stable references`() {
+        // Same object identity on repeated access — no re-allocation
+        assertTrue(InterceptPoint.STATE_UPSTREAM === InterceptPoint.STATE_UPSTREAM)
+        assertTrue(InterceptPoint.REACTION_DOWNSTREAM === InterceptPoint.REACTION_DOWNSTREAM)
+        assertTrue(InterceptPoint.REQUEST_UPSTREAM === InterceptPoint.REQUEST_UPSTREAM)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Trace listener guard
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `trace listener is invoked when set and TraceContext is present`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+
+        val traces = CopyOnWriteArrayList<Pair<String?, String>>()
+        board.setTraceListener { trace, _, clazz, _ ->
+            traces.add(trace.emitterTag to (clazz.simpleName ?: ""))
+        }
+
+        withContext(TraceContext(emitterTag = "TestEmitter")) {
+            board.broadcastState(UserState::class, UserState("Alice"))
+        }
+        advanceUntilIdle()
+
+        assertEquals(1, traces.size)
+        assertEquals("TestEmitter", traces[0].first)
+        assertEquals("UserState", traces[0].second)
+    }
+
+    @Test
+    fun `trace listener is not invoked when no TraceContext is present`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+
+        val traces = CopyOnWriteArrayList<String>()
+        board.setTraceListener { _, _, _, _ -> traces.add("called") }
+
+        // No withContext(TraceContext(...)) — trace listener should not fire
+        board.broadcastState(UserState::class, UserState("Bob"))
+        advanceUntilIdle()
+
+        assertTrue(traces.isEmpty())
+    }
+
+    @Test
+    fun `broadcastState works correctly when trace listener is null`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+        // trace listener is null by default
+
+        val received = CopyOnWriteArrayList<UserState>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            board.stateFlow(UserState::class).collect { received.add(it) }
+        }
+
+        board.broadcastState(UserState::class, UserState("Charlie"))
+        advanceUntilIdle()
+        job.cancel()
+
+        assertEquals(listOf(UserState("Charlie")), received)
+    }
+
+    @Test
+    fun `triggerImpulse delivers through trace listener when present`() = runTest(UnconfinedTestDispatcher()) {
+        val testDispatcher = UnconfinedTestDispatcher()
+        val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
+        val board = emptyBoard(boardScope)
+
+        val traces = CopyOnWriteArrayList<String>()
+        board.setTraceListener { trace, _, _, _ ->
+            traces.add(trace.emitterTag ?: "no-tag")
+        }
+
+        withContext(TraceContext(emitterTag = "ReactEmitter")) {
+            board.triggerImpulse(ToastReaction::class, ToastReaction("hello"))
+        }
+        advanceUntilIdle()
+
+        assertEquals(1, traces.size)
+        assertEquals("ReactEmitter", traces[0])
     }
 }

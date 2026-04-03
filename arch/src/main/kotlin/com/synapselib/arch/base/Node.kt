@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
+import kotlin.reflect.KClass
 
 /**
  * Base type for fire-and-forget events (reactions) that flow through the
@@ -226,12 +227,37 @@ inline fun <C, reified S : Any> ContextScope<C>.Node(
     return nodeScope
 }
 
+/**
+ * Thread-safe cache of serializer lookup results, keyed by [KClass].
+ *
+ * Avoids repeated exception-based control flow for non-`@Serializable`
+ * types: the first lookup per type pays the try/catch cost, and all
+ * subsequent lookups are a single map read.
+ */
+@PublishedApi
+internal val serializerCache = java.util.concurrent.ConcurrentHashMap<KClass<*>, Any>()
+
+/** Sentinel stored in [serializerCache] to represent a type with no serializer. */
+@PublishedApi
+internal object NoSerializer
+
+/**
+ * Returns the [KSerializer] for [S] if it is `@Serializable`, or `null` otherwise.
+ *
+ * Results are cached per type in [serializerCache] so that the try/catch
+ * (which allocates a stack trace on failure) only runs once per type over
+ * the lifetime of the process.
+ */
 inline fun <reified S : Any> serializerOrNull(): KSerializer<S>? {
-    return try {
-        serializer<S>()
-    } catch (_: Exception) {
-        null
+    val cached = serializerCache[S::class]
+    if (cached != null) {
+        @Suppress("UNCHECKED_CAST")
+        return if (cached === NoSerializer) null else cached as KSerializer<S>
     }
+    val result = try { serializer<S>() } catch (_: Exception) { null }
+    serializerCache[S::class] = result ?: NoSerializer
+    @Suppress("UNCHECKED_CAST")
+    return result
 }
 
 @Composable
