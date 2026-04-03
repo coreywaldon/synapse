@@ -34,9 +34,9 @@ import kotlin.collections.mutableListOf
  *                    attached to a [TraceContext] on every [CoordinatorScope.Trigger]
  *                    and [CoordinatorScope.Broadcast] call. When `null` (the default),
  *                    no tracing overhead is incurred.
- * @param block       initialization block — wire up listeners, interceptors, and
- *                    initial broadcasts here. Runs synchronously before the
- *                    function returns.
+ * @param block       initialization block — wire up listeners, interceptors,
+ *                    lifecycle hooks, and initial broadcasts here. Runs
+ *                    synchronously before the function returns.
  * @return the fully initialized [CoordinatorScope]. Call
  *         [CoordinatorScope.dispose] to cancel all jobs and unregister all
  *         interceptors (also happens automatically on ON_DESTROY).
@@ -310,7 +310,7 @@ class CoordinatorScope(
      * @param Need     the expected result type from the request handler.
      * @param I        the [Impulse] subtype describing the request.
      * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
-     * @return a [SharedFlow] with `replay = 1` emitting intercepted results.
+     * @return a [Flow] with `replay = 1` emitting intercepted results.
      */
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: I,
@@ -480,7 +480,7 @@ class CoordinatorScope(
      * Registers a [callback] to run when the [LifecycleOwner] reaches
      * [Lifecycle.Event.ON_DESTROY].
      *
-     * Note: The [CoordinatorScope] already auto-[disposes][dispose] on
+     * Note: The [CoordinatorScope] already auto-[dispose]s on
      * ON_DESTROY. Use this for additional cleanup that goes beyond what
      * [dispose] handles (e.g., closing external resources).
      *
@@ -497,7 +497,7 @@ class CoordinatorScope(
      * 1. **Cancels** the backing coroutine job and all of its children
      *    (listeners, in-flight requests, etc.).
      * 2. **Unregisters** every interceptor that was added via [Intercept].
-     * 3. **Clears** the internal registration list.
+     * 3. **Clears** the internal registration and lifecycle-callback lists.
      * 4. **Removes** the lifecycle observer from the [LifecycleOwner].
      *
      * This is called automatically when the [LifecycleOwner] reaches
