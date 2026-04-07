@@ -19,7 +19,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch:1.0.9")
+    implementation("com.synapselib:arch:1.0.10")
 }
 ```
 
@@ -28,6 +28,14 @@ For KSP provider generation, also add:
 ```kotlin
 plugins {
     id("com.google.devtools.ksp")
+}
+```
+
+For multi-module Hilt projects, add the aggregator in your app module:
+
+```kotlin
+dependencies {
+    implementation("com.synapselib:arch-hilt:1.0.10")
 }
 ```
 
@@ -645,37 +653,63 @@ val registry = ProviderRegistry.Builder()
 
 #### Hilt
 
-KSP generates `SynapseProviderModule_{ModuleName}` per Gradle module:
+KSP generates a `SynapseProviderModule_{ModuleName}` per Gradle module that contributes a `ProviderRegistryContribution` via Hilt multibinding (`@IntoSet`). The **`arch-hilt`** artifact provides an aggregator module that collects all contributions and merges them into a single `ProviderRegistry` singleton.
+
+This means providers can live in separate Gradle modules and are automatically discovered — no manual wiring required.
+
+**Setup:**
+
+```kotlin
+// In each feature module's build.gradle.kts
+plugins {
+    id("com.google.devtools.ksp")
+}
+
+dependencies {
+    implementation("com.synapselib:arch:1.0.10")
+    ksp("com.synapselib:arch:1.0.10")
+}
+
+ksp {
+    arg("synapse.moduleName", "FeatureAuth") // unique per module
+}
+
+// In your app module's build.gradle.kts
+dependencies {
+    implementation("com.synapselib:arch-hilt:1.0.10")
+}
+```
+
+**Generated code** (per module):
 
 ```kotlin
 @Module
 @InstallIn(SingletonComponent::class)
-object SynapseProviderModule_App {
-    @Provides @Singleton
-    fun provideRegistry(
+object SynapseProviderModule_FeatureAuth {
+    @Provides @IntoSet
+    fun provideContribution(
         fetchUserProfileProvider: javax.inject.Provider<FetchUserProfileProvider>,
-        searchProductsProvider: javax.inject.Provider<SearchProductsProvider>,
-    ): ProviderRegistry {
-        return ProviderRegistry.Builder()
+    ): ProviderRegistryContribution {
+        val registry = ProviderRegistry.Builder()
             .register(
                 impulseType = FetchUserProfile::class,
                 needClass = UserProfile::class.java,
                 factory = ProviderFactory { fetchUserProfileProvider.get() },
             )
-            .register(
-                impulseType = SearchProducts::class,
-                needClass = ProductPage::class.java,
-                factory = ProviderFactory { searchProductsProvider.get() },
-            )
             .build()
+        return ProviderRegistryContribution(registry)
     }
 }
 ```
 
-Testing override:
+The `SynapseProviderAggregatorModule` (from `arch-hilt`) automatically collects all contributions and provides the merged `ProviderRegistry`. If two modules register a provider for the same `DataImpulse` type, the app will fail at startup with a clear duplicate message.
+
+See the [arch-hilt README](../arch-hilt/README.md) for full details.
+
+**Testing override:**
 
 ```kotlin
-@UninstallModules(SynapseProviderModule_App::class)
+@UninstallModules(SynapseProviderModule_FeatureAuth::class)
 @HiltAndroidTest
 class MyTest {
     @BindValue
