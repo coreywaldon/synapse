@@ -1,15 +1,28 @@
 # Synapse Core
 
 ![Maven Central](https://img.shields.io/maven-central/v/com.synapselib/core)
-![Kotlin](https://img.shields.io/badge/kotlin-1.10.0-blue.svg?logo=kotlin)
+![Kotlin](https://img.shields.io/badge/kotlin-2.2.21-blue.svg?logo=kotlin)
 ![License](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+[![Build Status](https://github.com/coreywaldon/synapse/actions/workflows/publish.yml/badge.svg)](https://github.com/coreywaldon/synapse/actions/workflows/publish.yml)
 
 **Advanced Reactive Operators for Kotlin Coroutines.**
 
 Synapse extends the capabilities of standard Kotlin `Flow` by introducing a suite of powerful, time-aware, and stateful operators commonly found in functional reactive programming (FRP) but missing from the standard library.
 
 It bridges the gap between simple Coroutines and complex event processing, handling scenarios like time-windowed deduplication, conditional gating, and sequence detection with ease.
+
+---
+
+## 📚 The Synapse Family
+
+Synapse Core is one piece of a broader toolkit. If you're building a full application, the architecture layer on top is likely what you actually want:
+
+| Module | Purpose |
+|--------|---------|
+| **[synapse-core](.)** | Reactive operators for Kotlin `Flow` (this library) |
+| **[synapse-arch](arch/)** | Architecture framework — a typed message bus that eliminates cross-feature coordination. No ViewModels, no ad-hoc event buses. |
+| **[synapse-arch-hilt](arch-hilt/)** | Hilt integration for multi-module Synapse Arch projects |
+| **[synapse-arch-test](arch-test/)** | Test utilities for Synapse Arch — `SynapseTestRule` + interceptor-based capture helpers |
 
 ---
 

@@ -1,5 +1,10 @@
 # Synapse Arch Test
 
+![Maven Central](https://img.shields.io/maven-central/v/com.synapselib/arch-test)
+![Kotlin](https://img.shields.io/badge/kotlin-2.2.21-blue.svg?logo=kotlin)
+![License](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)
+[![Build Status](https://github.com/coreywaldon/synapse/actions/workflows/publish.yml/badge.svg)](https://github.com/coreywaldon/synapse/actions/workflows/publish.yml)
+
 Testing utilities for the [Synapse](https://github.com/coreywaldon/synapse) architecture framework. Provides `SynapseTestRule` — a JUnit 4 Rule that eliminates SwitchBoard boilerplate and exposes interceptor-based assertion helpers.
 
 ## Installation

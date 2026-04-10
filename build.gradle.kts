@@ -10,7 +10,7 @@ tasks.register("updateReadmeVersions") {
         val v = version.get()
         val pattern = Regex("""(com\.synapselib:[\w-]+:)\d+\.\d+\.\d+""")
 
-        listOf("README.md", "arch/README.md", "arch-test/README.md").forEach { path ->
+        listOf("README.md", "arch/README.md", "arch-hilt/README.md", "arch-test/README.md").forEach { path ->
             val file = projectDir.file(path).asFile
             if (file.exists()) {
                 val original = file.readText()
