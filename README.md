@@ -40,7 +40,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:core:1.0.10")
+    implementation("com.synapselib:core:1.0.11")
 }
 ```
 

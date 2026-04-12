@@ -67,7 +67,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch:1.0.10")
+    implementation("com.synapselib:arch:1.0.11")
 }
 ```
 
@@ -83,7 +83,7 @@ For multi-module Hilt projects, add the aggregator in your app module:
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.10")
+    implementation("com.synapselib:arch-hilt:1.0.11")
 }
 ```
 
@@ -821,8 +821,8 @@ plugins {
 }
 
 dependencies {
-    implementation("com.synapselib:arch:1.0.10")
-    ksp("com.synapselib:arch:1.0.10")
+    implementation("com.synapselib:arch:1.0.11")
+    ksp("com.synapselib:arch:1.0.11")
 }
 
 ksp {
@@ -831,7 +831,7 @@ ksp {
 
 // In your app module's build.gradle.kts
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.10")
+    implementation("com.synapselib:arch-hilt:1.0.11")
 }
 ```
 

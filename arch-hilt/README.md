@@ -30,7 +30,7 @@ Add `arch-hilt` to your **app module** (the module that sets up the Hilt compone
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.10")
+    implementation("com.synapselib:arch-hilt:1.0.11")
 }
 ```
 
@@ -43,8 +43,8 @@ plugins {
 }
 
 dependencies {
-    implementation("com.synapselib:arch:1.0.10")
-    ksp("com.synapselib:arch:1.0.10")
+    implementation("com.synapselib:arch:1.0.11")
+    ksp("com.synapselib:arch:1.0.11")
 }
 
 ksp {
