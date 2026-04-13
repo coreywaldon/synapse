@@ -42,6 +42,7 @@ import kotlin.collections.mutableListOf
  *         [CoordinatorScope.dispose] to cancel all jobs and unregister all
  *         interceptors (also happens automatically on ON_DESTROY).
  */
+@Suppress("FunctionName")
 fun Coordinator(
     switchboard: SwitchBoard,
     owner: LifecycleOwner,
@@ -215,6 +216,7 @@ class CoordinatorScope(
      * @param priority    execution priority; lower values run first. Defaults to `0`.
      * @return the [Registration] handle, also stored internally for cleanup.
      */
+    @Suppress("FunctionName")
     inline fun <reified T : Any> Intercept(
         point: InterceptPoint,
         interceptor: Interceptor<T>,
@@ -236,6 +238,7 @@ class CoordinatorScope(
      * @param data the value to broadcast.
      * @see SwitchBoard.broadcastState
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified O : Any> Broadcast(data: O) {
         if (tag != null) {
             withContext(TraceContext(emitterTag = tag)) {
@@ -256,6 +259,7 @@ class CoordinatorScope(
      * @param event the impulse event to emit.
      * @see SwitchBoard.triggerImpulse
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
         if (tag != null) {
             withContext(TraceContext(emitterTag = tag)) {
@@ -288,6 +292,7 @@ class CoordinatorScope(
      * @param O the state type (inferred).
      * @return a [SharedFlow] with `replay = 1` emitting intercepted state values.
      */
+    @Suppress("FunctionName")
     inline fun <reified O : Any> ListenFor(): SharedFlow<O> =
         switchboard.stateFlow(O::class)
 
@@ -308,6 +313,7 @@ class CoordinatorScope(
      * @param A the [Impulse] subtype (inferred).
      * @return a [SharedFlow] with `replay = 0` emitting intercepted impulse events.
      */
+    @Suppress("FunctionName")
     inline fun <reified A : Impulse> ReactTo(): SharedFlow<A> =
         switchboard.impulseFlow(A::class)
 
@@ -322,6 +328,7 @@ class CoordinatorScope(
      * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
      * @return a [Flow] with `replay = 1` emitting intercepted results.
      */
+    @Suppress("FunctionName")
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: I,
     ): Flow<DataState<Need>> = switchboard.handleRequest(impulse)
@@ -348,6 +355,7 @@ class CoordinatorScope(
      *                [CoordinatorScope] as the receiver.
      * @return the [Job] backing this subscription.
      */
+    @Suppress("FunctionName")
     inline fun <reified O : Any> ListenFor(
         noinline handler: CoordinatorScope.(O) -> Unit,
     ): Job = launch {
@@ -377,6 +385,7 @@ class CoordinatorScope(
      *                as the receiver.
      * @return the [Job] backing this subscription.
      */
+    @Suppress("FunctionName")
     inline fun <reified A : Impulse> ReactTo(
         noinline handler: CoordinatorScope.(A) -> Unit,
     ): Job = launch {
@@ -398,6 +407,7 @@ class CoordinatorScope(
      *                 receiver.
      * @return the [Job] backing this request.
      */
+    @Suppress("FunctionName")
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: I,
         noinline callback: CoordinatorScope.(DataState<Need>) -> Unit,

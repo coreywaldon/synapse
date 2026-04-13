@@ -116,7 +116,7 @@ private class MinHeap<T>(private val compare: (T, T) -> Int) {
         val last = items.removeAt(items.size - 1)
         if (items.isNotEmpty()) {
             items[0] = last
-            siftDown(0)
+            siftDown()
         }
         return top
     }
@@ -134,8 +134,8 @@ private class MinHeap<T>(private val compare: (T, T) -> Int) {
         }
     }
 
-    private fun siftDown(from: Int) {
-        var i = from
+    private fun siftDown() {
+        var i = 0
         val n = items.size
         while (true) {
             val left = 2 * i + 1

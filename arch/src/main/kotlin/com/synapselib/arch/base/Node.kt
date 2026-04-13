@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -81,8 +82,13 @@ inline fun <T> CreateContext(
     crossinline block: @Composable ContextScope<T>.() -> Unit,
 ) {
     val switchboard = LocalSwitchBoard.current
-    val scope = remember(context, switchboard, tag) { ContextScope(context, switchboard, tag) }
-    scope.block()
+    val coroutineScope = rememberCoroutineScope()
+    val scope = remember(context, switchboard, tag) {
+        ContextScope(context, switchboard, coroutineScope, tag)
+    }
+    key(scope) {
+        scope.block()
+    }
 }
 
 /**
@@ -94,18 +100,21 @@ inline fun <T> CreateContext(
  * so that [Node] can access both the context and the switchboard without
  * threading them through parameters manually.
  *
- * @param T           the type of the context value.
- * @property context     the domain object shared across all [Node]s in this
- *                       context boundary (e.g., a ViewModel).
- * @property switchboard the [SwitchBoard] used for all cross-node communication
- *                       (state broadcasts, reactions, requests, interception).
- * @property tag         optional emitter label for [TraceContext]. When non-null,
- *                       every [Trigger] and [Broadcast] call wraps execution in a
- *                       `withContext(TraceContext(emitterTag = tag))`.
+ * @param T                 the type of the context value.
+ * @property context        the domain object shared across all [Node]s in this
+ *                          context boundary (e.g., a ViewModel).
+ * @property switchboard    the [SwitchBoard] used for all cross-node communication
+ *                          (state broadcasts, reactions, requests, interception).
+ * @property coroutineScope a [CoroutineScope] available for callers within a
+ *                          [ContextScope].
+ * @property tag            optional emitter label for [TraceContext]. When non-null,
+ *                          every [Trigger] and [Broadcast] call wraps execution in a
+ *                          `withContext(TraceContext(emitterTag = tag))`.
  */
 class ContextScope<T>(
     val context: T,
     val switchboard: SwitchBoard,
+    val coroutineScope: CoroutineScope = CoroutineScope(Dispatchers.Default),
     val tag: String? = null,
 ) {
     /**
@@ -124,6 +133,7 @@ class ContextScope<T>(
      * @param A     the [Impulse] subtype (inferred).
      * @param event the impulse event to emit.
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
         if (tag != null) {
             withContext(TraceContext(emitterTag = tag)) {
@@ -151,6 +161,7 @@ class ContextScope<T>(
      * @param O    the state type (inferred).
      * @param data the value to broadcast.
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified O : Any> Broadcast(data: O) {
         if (tag != null) {
             withContext(TraceContext(emitterTag = tag)) {
@@ -382,6 +393,7 @@ class NodeScope<C, S : Any>(
      * @param interceptor the [Interceptor] to install.
      * @param priority    execution priority; lower values run first. Defaults to `0`.
      */
+    @Suppress("FunctionName")
     inline fun <reified T : Any> Intercept(
         point: InterceptPoint,
         interceptor: Interceptor<T>,
@@ -411,6 +423,7 @@ class NodeScope<C, S : Any>(
      * @param O    the state type (inferred).
      * @param data the value to broadcast.
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified O : Any> Broadcast(data: O) {
         contextScope.Broadcast(data)
     }
@@ -431,6 +444,7 @@ class NodeScope<C, S : Any>(
      * @param A     the [Impulse] subtype (inferred).
      * @param event the impulse event to emit.
      */
+    @Suppress("FunctionName")
     suspend inline fun <reified A : Impulse> Trigger(event: A) {
         contextScope.Trigger(event)
     }
