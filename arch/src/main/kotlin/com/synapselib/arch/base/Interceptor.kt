@@ -345,6 +345,7 @@ class InterceptorRegistry : InterceptorPipeline {
         val set = map.getOrPut(clazz) { ConcurrentSkipListSet(entryComparator) }
         val entry = Entry(priority, insertionCounter.getAndIncrement(), clazz.java, interceptor)
         set.add(entry)
+        version.incrementAndGet()
         return Registration {
             set.remove(entry)
             version.incrementAndGet()

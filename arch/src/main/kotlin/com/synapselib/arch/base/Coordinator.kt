@@ -318,15 +318,17 @@ class CoordinatorScope(
         switchboard.impulseFlow(A::class)
 
     /**
-     * Returns the downstream-intercepted [SharedFlow] for the result of
-     * routing [impulse] through the [SwitchBoard]'s request pipeline.
+     * Returns the downstream-intercepted [Flow] for the result of routing
+     * [impulse] through the [SwitchBoard]'s request pipeline.
      *
-     * Use this overload when you need access to the raw flow.
+     * Use this overload when you need access to the raw flow. The returned
+     * flow is cold; see [SwitchBoard.handleRequest] for the dedup/replay
+     * semantics of the underlying provider.
      *
      * @param Need     the expected result type from the request handler.
      * @param I        the [Impulse] subtype describing the request.
      * @param impulse  parameters forwarded to the [SwitchBoard]'s request pipeline.
-     * @return a [Flow] with `replay = 1` emitting intercepted results.
+     * @return a cold [Flow] emitting intercepted [DataState] results.
      */
     @Suppress("FunctionName")
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
@@ -524,9 +526,13 @@ class CoordinatorScope(
      * [Lifecycle.Event.ON_DESTROY]. You may also call it manually for
      * earlier cleanup.
      *
-     * After calling [dispose], the scope is no longer usable — launching new
-     * coroutines or registering interceptors will fail with a
-     * [kotlinx.coroutines.CancellationException].
+     * After calling [dispose], the backing [Job] is canceled. Coroutines
+     * started via [launch] / [kotlinx.coroutines.async] return immediately in
+     * a canceled state — their bodies do not execute past the first suspension
+     * point, and the builder itself does not throw. Calling [Intercept] after
+     * dispose is unsupported: the underlying [SwitchBoard] registration will
+     * succeed, but auto-cleanup has already run, so the registration will leak
+     * unless you call [dispose] again.
      *
      * This method is idempotent; calling it multiple times is safe.
      */

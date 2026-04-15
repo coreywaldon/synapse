@@ -21,7 +21,7 @@ package com.synapselib.arch.base
  *
  * Because [Need] is declared on the impulse itself, the framework can
  * enforce that:
- * - `Request(FetchUserProfile(42))` returns `StateFlow<DataState<UserProfile>>`
+ * - `Request(FetchUserProfile(42))` returns `Flow<DataState<UserProfile>>`
  *   (inferred, not manually specified).
  * - The [com.synapselib.arch.base.provider.SynapseProvider] handling `FetchUserProfile` must produce `UserProfile`.
  * - KSP can validate at compile time that every concrete [DataImpulse]

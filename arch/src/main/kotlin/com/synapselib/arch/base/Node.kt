@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
 import kotlin.reflect.KClass
@@ -63,8 +64,8 @@ open class Impulse
  * }
  * ```
  *
- * The [ContextScope] is `remember`ed by [context] and the [SwitchBoard],
- * so it is recreated only when either of those identities changes.
+ * The [ContextScope] is `remember`ed by [context], the [SwitchBoard], and
+ * [tag], so it is recreated only when any of those identities changes.
  *
  * @param T       the type of the context value.
  * @param context the value made available to all child scopes via
@@ -265,7 +266,7 @@ inline fun <reified S : Any> serializerOrNull(): KSerializer<S>? {
         @Suppress("UNCHECKED_CAST")
         return if (cached === NoSerializer) null else cached as KSerializer<S>
     }
-    val result = try { serializer<S>() } catch (_: Exception) { null }
+    val result = try { serializer<S>() } catch (_: SerializationException) { null }
     serializerCache[S::class] = result ?: NoSerializer
     @Suppress("UNCHECKED_CAST")
     return result
@@ -453,14 +454,14 @@ class NodeScope<C, S : Any>(
 
     /**
      * Launches a request through the [SwitchBoard] and delivers each result
-     * to [callback] by collecting the returned [kotlinx.coroutines.flow.SharedFlow].
+     * to [callback] by collecting the returned cold [kotlinx.coroutines.flow.Flow].
      *
      * The request is canceled and relaunched whenever [key] changes, and
      * canceled when this composable leaves the composition.
      *
      * ```kotlin
      * Request<UserProfile, FetchUserParams>(
-     *     params = FetchUserParams(userId = 42),
+     *     impulse = FetchUserParams(userId = 42),
      * ) { profile ->
      *     update { it.copy(user = profile) }
      * }

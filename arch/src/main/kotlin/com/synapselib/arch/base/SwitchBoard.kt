@@ -159,23 +159,27 @@ interface SwitchBoard {
     suspend fun <T : Any> triggerImpulse(clazz: KClass<T>, data: T)
 
     /**
-     * Routes a request through the interceptor pipeline and returns a
-     * [SharedFlow] of results with `replay = 1`.
+     * Routes a request through the interceptor pipeline and returns a cold
+     * [Flow] of [DataState] results.
      *
      * 1. **Upstream interceptors** (`REQUEST / UPSTREAM`) are applied to the [impulse].
      * 2. The (possibly transformed) params are forwarded to the [com.synapselib.arch.base.provider.ProviderManager].
      * 3. **Downstream interceptors** (`REQUEST / DOWNSTREAM`) are applied to
-     *    each result before it is emitted into the shared flow.
+     *    each `Success`/`Error` payload before it is emitted.
      *
-     * The flow starts lazily on the first subscriber; after that, the result
-     * is cached via replay for late collectors.
+     * The returned flow is cold — each subscriber re-runs upstream interception
+     * and subscribes to the provider pipeline. The provider itself deduplicates
+     * in-flight work by impulse equality and retains the most recent
+     * [DataState] via an internal `replay = 1` buffer, so a late subscriber
+     * that arrives before the underlying job completes still observes the
+     * latest state.
      *
      * @param Need        the type of the result expected by the caller.
      * @param I           the concrete [DataImpulse] subtype.
      * @param impulseType the [KClass] token for [DataImpulse]
      * @param needType    the [KClass] token for [Need], used for type-safe
      *                    downstream interception.
-     * @return a [SharedFlow] that emits the intercepted result(s).
+     * @return a cold [Flow] that emits intercepted [DataState] values.
      */
     fun <Need : Any, I : DataImpulse<Need>> handleRequest(
         impulseType: KClass<I>,
@@ -285,16 +289,18 @@ inline fun <reified T : Any> SwitchBoard.addInterceptor(
  * @param T The data type for which the logging interceptors are applied.
  * @param log A function that performs logging or side effects for each observed data instance of type [T].
  */
-inline fun <reified T: Any> SwitchBoard.addLoggingInterceptors(crossinline log: (T) -> Unit) {
+inline fun <reified T: Any> SwitchBoard.addLoggingInterceptors(crossinline log: (T) -> Unit): Registration {
+    val registrations = ArrayList<Registration>(Channel.entries.size * Direction.entries.size)
     for (channel in Channel.entries) {
         for (direction in Direction.entries) {
-            addInterceptor(
+            registrations += addInterceptor(
                 point       = InterceptPoint(channel, direction),
                 interceptor = Interceptor.read<T> { data -> log.invoke(data) },
                 priority    = if (direction == Direction.UPSTREAM) Int.MIN_VALUE else Int.MAX_VALUE,
             )
         }
     }
+    return Registration { registrations.forEach { it.unregister() } }
 }
 
 @Qualifier
@@ -454,10 +460,7 @@ class DefaultSwitchBoard @Inject constructor(
                     }
                 }
 
-                else -> {
-                    processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state)
-                    emit(state)
-                }
+                else -> emit(state)
             }
         }
     }
@@ -548,10 +551,11 @@ class DefaultSwitchBoard @Inject constructor(
         // Guard: only call currentCoroutineContext() when a trace listener is
         // actually registered. This avoids the suspend intrinsic overhead on
         // every emission in the common case where tracing is disabled.
-        if (traceListener.get() != null) {
+        val listener = traceListener.get()
+        if (listener != null) {
             val trace = currentCoroutineContext()[TraceContext]
             if (trace != null) {
-                traceListener.get()?.invoke(trace, point, clazz, processed)
+                listener.invoke(trace, point, clazz, processed)
             }
         }
         return processed
