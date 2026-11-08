@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ReactiveFlowTest {
@@ -121,10 +122,8 @@ class ReactiveFlowTest {
         job.cancel()
     }
 
-    // Helper to bridge TestScope time to the operators
-    private fun TestScope.nanoTimeSource(): () -> Long = {
-        this.testScheduler.currentTime * 1_000_000
-    }
+    // Helper to bridge TestScope virtual time to the operators
+    private fun TestScope.virtualTimeSource(): TimeSource = testTimeSource
 
     @Test
     fun `pace delays signals instead of dropping them`() = runTest {
@@ -140,7 +139,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .pace(100.milliseconds, nanoTimeSource())
+                .pace(100.milliseconds, virtualTimeSource())
                 .collect {
                     results.add(it)
                     emissionTimes.add(testScheduler.currentTime)
@@ -368,7 +367,7 @@ class ReactiveFlowTest {
                 .squash(
                     500.milliseconds,
                     maxDistinctValues = 1,
-                    timeSource = nanoTimeSource()
+                    timeSource = virtualTimeSource()
                 )
                 .collect { results.add(it) }
         }
@@ -395,7 +394,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .squash(500.milliseconds, timeSource = nanoTimeSource())
+                .squash(500.milliseconds, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -421,7 +420,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .squash(500.milliseconds, timeSource = nanoTimeSource())
+                .squash(500.milliseconds, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -443,7 +442,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .squash(500.milliseconds, timeSource = nanoTimeSource())
+                .squash(500.milliseconds, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -474,7 +473,7 @@ class ReactiveFlowTest {
                 .squash(
                     retentionPeriod = 500.milliseconds,
                     maxDistinctValues = 2,
-                    timeSource = nanoTimeSource()
+                    timeSource = virtualTimeSource()
                 )
                 .collect { results.add(it) }
         }
@@ -505,7 +504,7 @@ class ReactiveFlowTest {
                 .squash(
                     retentionPeriod = 500.milliseconds,
                     shouldSquash = { it == "A" },
-                    timeSource = nanoTimeSource()
+                    timeSource = virtualTimeSource()
                 )
                 .collect { results.add(it) }
         }
@@ -528,7 +527,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .pace(100.milliseconds, nanoTimeSource())
+                .pace(100.milliseconds, virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -553,7 +552,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .pace(100.milliseconds, nanoTimeSource())
+                .pace(100.milliseconds, virtualTimeSource())
                 .collect {
                     results.add(it)
                     emissionTimes.add(testScheduler.currentTime)
@@ -744,7 +743,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = false, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = false, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -766,7 +765,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = false, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = false, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -791,7 +790,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = true, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = true, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -816,7 +815,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = true, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = true, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -839,7 +838,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = true, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = true, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -863,7 +862,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = false, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = false, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -888,7 +887,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = false, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = false, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 
@@ -916,7 +915,7 @@ class ReactiveFlowTest {
 
         val job = launch {
             flow.asReactive()
-                .combo(sequences, 100.milliseconds, greedy = false, timeSource = nanoTimeSource())
+                .combo(sequences, 100.milliseconds, greedy = false, timeSource = virtualTimeSource())
                 .collect { results.add(it) }
         }
 

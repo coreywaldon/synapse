@@ -28,12 +28,16 @@ class TypedStateFlow<T : Any>(
 ) : StateFlow<T> {
 
     override val value: T
-        get() = clazz.checkedCast(source.value)
+        get() = clazz.checkedCast(source.value, CONTEXT)
 
     override val replayCache: List<T>
-        get() = source.replayCache.map { clazz.checkedCast(it) }
+        get() = source.replayCache.map { clazz.checkedCast(it, CONTEXT) }
 
     override suspend fun collect(collector: FlowCollector<T>): Nothing {
-        source.collect { collector.emit(clazz.checkedCast(it)) }
+        source.collect { collector.emit(clazz.checkedCast(it, CONTEXT)) }
+    }
+
+    private companion object {
+        const val CONTEXT = "TypedStateFlow element"
     }
 }

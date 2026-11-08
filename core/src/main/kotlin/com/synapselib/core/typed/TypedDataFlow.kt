@@ -35,13 +35,17 @@ class TypedDataStateFlow<T : Any>(
 ) : StateFlow<DataState<T>> {
 
     override val value: DataState<T>
-        get() = source.value.checkedCast(clazz)
+        get() = source.value.checkedCast(clazz, CONTEXT)
 
     override val replayCache: List<DataState<T>>
-        get() = source.replayCache.map { it.checkedCast(clazz) }
+        get() = source.replayCache.map { it.checkedCast(clazz, CONTEXT) }
 
     override suspend fun collect(collector: FlowCollector<DataState<T>>): Nothing {
-        source.collect { collector.emit(it.checkedCast(clazz)) }
+        source.collect { collector.emit(it.checkedCast(clazz, CONTEXT)) }
+    }
+
+    private companion object {
+        const val CONTEXT = "TypedDataStateFlow"
     }
 }
 
@@ -63,9 +67,13 @@ class TypedDataSharedFlow<T : Any>(
 ) : SharedFlow<DataState<T>> {
 
     override val replayCache: List<DataState<T>>
-        get() = source.replayCache.map { it.checkedCast(clazz) }
+        get() = source.replayCache.map { it.checkedCast(clazz, CONTEXT) }
 
     override suspend fun collect(collector: FlowCollector<DataState<T>>): Nothing {
-        source.collect { collector.emit(it.checkedCast(clazz)) }
+        source.collect { collector.emit(it.checkedCast(clazz, CONTEXT)) }
+    }
+
+    private companion object {
+        const val CONTEXT = "TypedDataSharedFlow"
     }
 }

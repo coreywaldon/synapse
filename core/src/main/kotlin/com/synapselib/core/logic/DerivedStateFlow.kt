@@ -4,6 +4,7 @@ import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 // --- Infix Logic Operators ---
 
@@ -31,7 +32,10 @@ infix fun StateFlow<Boolean>.imp(other: StateFlow<Boolean>): StateFlow<Boolean> 
 infix fun StateFlow<Boolean>.nimp(other: StateFlow<Boolean>): StateFlow<Boolean> =
     DerivedStateFlow(this, other) { args -> args[0] && !args[1] }
 
-fun StateFlow<Boolean>.not(): StateFlow<Boolean> =
+/**
+ * Logical negation. Declared as an `operator`, so `!flow` works as well as `flow.not()`.
+ */
+operator fun StateFlow<Boolean>.not(): StateFlow<Boolean> =
     DerivedStateFlow(this) { args -> !args[0] }
 
 // --- Vararg Logic Extensions ---
@@ -59,6 +63,10 @@ fun StateFlow<Boolean>.xnor(vararg others: StateFlow<Boolean>): StateFlow<Boolea
 /**
  * A lightweight StateFlow that derives its value from parent flows.
  * It computes .value synchronously and combines updates for collectors.
+ *
+ * Honours the [StateFlow] contract: collectors never observe two equal consecutive values,
+ * even when a parent changes without changing the derived result (e.g. `false and x` while
+ * `x` toggles). The flow never completes.
  */
 @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
 private class DerivedStateFlow(
@@ -73,10 +81,11 @@ private class DerivedStateFlow(
         get() = listOf(value)
 
     override suspend fun collect(collector: FlowCollector<Boolean>): Nothing {
-        // Combine ensures we emit whenever any parent changes
+        // Combine ensures we re-evaluate whenever any parent changes; distinctUntilChanged
+        // restores StateFlow's "no equal consecutive values" guarantee for the derived result.
         combine(flows.toList()) { values ->
             transform(values)
-        }.collect(collector)
+        }.distinctUntilChanged().collect(collector)
         // StateFlows are hot and never complete normally
         throw kotlinx.coroutines.CancellationException("DerivedStateFlow should not complete")
     }
