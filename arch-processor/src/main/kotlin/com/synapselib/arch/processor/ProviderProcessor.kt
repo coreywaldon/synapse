@@ -1,4 +1,4 @@
-package com.synapselib.arch.base.provider
+package com.synapselib.arch.processor
 
 import com.google.devtools.ksp.getClassDeclarationByName
 import com.google.devtools.ksp.isAbstract
@@ -29,7 +29,15 @@ import kotlin.collections.iterator
  * 4. **Duplicate detection**: ensures no two providers handle the same
  *    `DataImpulse` type — reports a compiler error if they do.
  * 5. **Code generation**: emits a Hilt `@Module` and a Koin module that
- *    build a [ProviderRegistry] from the discovered providers.
+ *    build a `ProviderRegistry` from the discovered providers.
+ *
+ * ## Packaging
+ *
+ * The processor ships as the compile-only `com.synapselib:arch-processor`
+ * artifact and deliberately does **not** depend on `arch`: every `arch`,
+ * Dagger/Hilt and Koin type is referenced by fully-qualified name and the
+ * generated code is emitted as plain source text. Keep it that way so
+ * consumers' runtime classpaths never see KSP or this processor.
  *
  * ## Compile-Time Errors
  *
@@ -48,7 +56,7 @@ class ProviderProcessor(
 ) : SymbolProcessor {
 
     companion object {
-        /** Fully qualified name of the `@[SynapseProvider]` annotation. */
+        /** Fully qualified name of the `@SynapseProvider` annotation. */
         const val ANNOTATION_FQN = "com.synapselib.arch.base.provider.SynapseProvider"
 
         /** Fully qualified name of the `Provider` base class. */

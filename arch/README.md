@@ -67,15 +67,19 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch:1.0.13")
+    implementation("com.synapselib:arch:1.1.0")
 }
 ```
 
-For KSP provider generation, also add:
+For KSP provider generation (`@SynapseProvider`), also apply KSP and add the processor:
 
 ```kotlin
 plugins {
     id("com.google.devtools.ksp")
+}
+
+dependencies {
+    ksp("com.synapselib:arch-processor:1.1.0")
 }
 ```
 
@@ -83,9 +87,15 @@ For multi-module Hilt projects, add the aggregator in your app module:
 
 ```kotlin
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.13")
+    implementation("com.synapselib:arch-hilt:1.1.0")
 }
 ```
+
+> **Migrating from 1.0.x:** the KSP processor moved out of the `arch` runtime artifact into its own
+> compile-only artifact, [`arch-processor`](../arch-processor/README.md). Replace
+> `ksp("com.synapselib:arch:<version>")` with `ksp("com.synapselib:arch-processor:<version>")`.
+> `arch` no longer drags `dagger-compiler`, KSP, AutoService or Compose Foundation onto your runtime
+> classpath — if your app relied on any of them transitively, declare them directly.
 
 ---
 
@@ -821,8 +831,8 @@ plugins {
 }
 
 dependencies {
-    implementation("com.synapselib:arch:1.0.13")
-    ksp("com.synapselib:arch:1.0.13")
+    implementation("com.synapselib:arch:1.1.0")
+    ksp("com.synapselib:arch-processor:1.1.0")
 }
 
 ksp {
@@ -831,7 +841,7 @@ ksp {
 
 // In your app module's build.gradle.kts
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.13")
+    implementation("com.synapselib:arch-hilt:1.1.0")
 }
 ```
 
