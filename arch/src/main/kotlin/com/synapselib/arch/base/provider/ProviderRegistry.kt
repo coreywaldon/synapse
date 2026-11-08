@@ -29,7 +29,7 @@ import kotlin.reflect.KClass
  *     @Provides @Singleton
  *     fun provideRegistry(api: UserApi): ProviderRegistry =
  *         ProviderRegistry.Builder()
- *             .register<UserProfile, FetchUserProfile>(UserProfile::class.java) {
+ *             .register<UserProfile, FetchUserProfile> {
  *                 FetchUserProfileProvider(api)
  *             }
  *             .build()
@@ -37,7 +37,7 @@ import kotlin.reflect.KClass
  *
  * // Test — only what you need
  * val registry = ProviderRegistry.Builder()
- *     .register<UserProfile, FetchUserProfile>(UserProfile::class.java) {
+ *     .register<UserProfile, FetchUserProfile> {
  *         FakeUserProfileProvider()
  *     }
  *     .build()
@@ -171,10 +171,10 @@ class ProviderRegistry private constructor(
      * Designed for fluent construction:
      * ```kotlin
      * val registry = ProviderRegistry.Builder()
-     *     .register<UserProfile, FetchUserProfile>(UserProfile::class.java) {
+     *     .register<UserProfile, FetchUserProfile> {
      *         FetchUserProfileProvider(api)
      *     }
-     *     .register<ProductPage, SearchProducts>(ProductPage::class.java) {
+     *     .register<ProductPage, SearchProducts> {
      *         SearchProductsProvider(api)
      *     }
      *     .build()

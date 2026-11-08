@@ -263,7 +263,20 @@ Hidden (`DeprecationLevel.HIDDEN`) bridges keep the original JVM signatures of t
 
 ### Fixed
 
+**arch-processor**
+- The generated Koin module declared each provider as `factory { get<Provider>() }`, which
+  resolves itself recursively; it now uses `factoryOf(::Provider)` so constructor
+  dependencies are resolved from Koin.
+- Generated Hilt and Koin registries are labelled with the KSP module name
+  (`ProviderRegistry.Builder(name = "<Module>")`), so a duplicate `DataImpulse` across Gradle
+  modules fails at startup naming both modules.
+- The generated Hilt module's testing KDoc used `@BindValue ProviderRegistry`, which clashes
+  with the aggregator binding; it now shows `@BindValueIntoSet ProviderRegistryContribution`.
+- Stray `}` in the "DataImpulse must be a data class" error message.
+
 **arch**
+- `NoProviderException` told users to annotate with `@Provider`; the annotation is
+  `@SynapseProvider`.
 - `NodeScope.Intercept` leaked one interceptor registration per recomposition.
 - Coordinator `onCreate` / `onStart` / `onResume` hooks never fired when the owner was already
   past that state.

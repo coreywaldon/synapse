@@ -544,7 +544,7 @@ class ProviderManager(
 class NoProviderException(
     impulseType: KClass<*>,
     message: String = "No provider registered for impulse type: ${impulseType.simpleName}. " +
-            "Annotate a Provider implementation with @Provider for this impulse type.",
+            "Annotate a Provider implementation with @SynapseProvider for this impulse type.",
 ) : RuntimeException(message)
 
 /**

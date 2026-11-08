@@ -251,7 +251,7 @@ class ProviderProcessor(
         val impulseDecl = impulseType.declaration as? KSClassDeclaration
         if (impulseDecl != null && !impulseDecl.modifiers.contains(Modifier.DATA)) {
             logger.error(
-                "DataImpulse '$impulseFqn}' MUST be a data class " +
+                "DataImpulse '$impulseFqn' MUST be a data class " +
                         "to ensure correct request deduplication.",
                 impulseDecl
             )
@@ -394,10 +394,12 @@ class ProviderProcessor(
                 appendLine(" * @UninstallModules(SynapseProviderModule_$moduleName::class)")
                 appendLine(" * @HiltAndroidTest")
                 appendLine(" * class MyTest {")
-                appendLine(" *     @BindValue")
-                appendLine(" *     val registry = ProviderRegistry.Builder()")
-                appendLine(" *         .register<Need, Impulse> { FakeProvider() }")
-                appendLine(" *         .build()")
+                appendLine(" *     @BindValueIntoSet")
+                appendLine(" *     val contribution = ProviderRegistryContribution(")
+                appendLine(" *         ProviderRegistry.Builder(name = \"Test\")")
+                appendLine(" *             .register<Need, Impulse> { FakeProvider() }")
+                appendLine(" *             .build()")
+                appendLine(" *     )")
                 appendLine(" * }")
                 appendLine(" * ```")
                 appendLine(" */")
@@ -463,6 +465,7 @@ class ProviderProcessor(
                 appendLine()
                 appendLine("import com.synapselib.arch.base.provider.ProviderFactory")
                 appendLine("import com.synapselib.arch.base.provider.ProviderRegistry")
+                appendLine("import org.koin.core.module.dsl.factoryOf")
                 appendLine("import org.koin.dsl.module")
                 appendLine()
 
@@ -511,8 +514,10 @@ class ProviderProcessor(
                 appendLine()
 
                 // Declare each provider as a Koin factory (new instance per get()).
+                // `factoryOf(::Ctor)` resolves constructor parameters from Koin; the
+                // previous `factory { get<Provider>() }` resolved itself recursively.
                 for (entry in entries) {
-                    appendLine("    factory { get<${entry.providerSimpleName}>() }")
+                    appendLine("    factoryOf(::${entry.providerSimpleName})")
                 }
 
                 appendLine()
