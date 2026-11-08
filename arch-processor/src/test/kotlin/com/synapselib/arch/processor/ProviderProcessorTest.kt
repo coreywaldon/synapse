@@ -112,6 +112,10 @@ class ProviderProcessorTest {
             setOf("com.example.feature.FetchUser", "com.example.feature.FetchFriends"),
             contribution.registry.registeredImpulseTypes().map { it.qualifiedName }.toSet(),
         )
+        // The registry is labelled with the module name so cross-module
+        // duplicate-provider errors can say which modules collided.
+        assertEquals("FeatureAuth", contribution.registry.name)
+        assertEquals("FeatureAuth", contribution.name)
     }
 
     @Test

@@ -427,7 +427,7 @@ class ProviderProcessor(
                     appendLine("        $paramName: javax.inject.Provider<${entry.providerSimpleName}>$trailing")
                 }
                 appendLine("    ): ProviderRegistryContribution {")
-                appendLine("        val registry = ProviderRegistry.Builder()")
+                appendLine("        val registry = ProviderRegistry.Builder(name = \"$moduleName\")")
 
                 for (entry in entries) {
                     val paramName = entry.providerSimpleName.replaceFirstChar { it.lowercase() }
@@ -517,7 +517,7 @@ class ProviderProcessor(
 
                 appendLine()
                 appendLine("    single<ProviderRegistry> {")
-                appendLine("        ProviderRegistry.Builder()")
+                appendLine("        ProviderRegistry.Builder(name = \"$moduleName\")")
 
                 for (entry in entries) {
                     val needClassExpr = needClassExpression(entry)
