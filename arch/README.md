@@ -721,15 +721,15 @@ Node(initialState = ProductListState()) {
 
 ## 🔗 Interceptors
 
-Chainable middleware (similar to OkHttp interceptors) registered at any of 6 intercept points.
+Chainable middleware (similar to OkHttp interceptors) registered at any of 6 intercept points. **The end of the chain is the dispatch**: a value is emitted, routed to its provider or delivered only if a `proceed` call reaches the end of the chain. An interceptor that does not call `proceed` [blocks](#blocking-not-calling-proceed) the value.
 
 ### Factory methods
 
-| Factory                                          | Behavior                                          |
-|--------------------------------------------------|---------------------------------------------------|
-| `Interceptor.read { data -> ... }`               | Observe only — always proceeds with original data |
-| `Interceptor.transform { data -> modifiedData }` | Maps data before proceeding                       |
-| `Interceptor.full { data, proceed -> ... }`      | Full control: retry, skip, wrap, short-circuit    |
+| Factory                                          | Behavior                                               |
+|--------------------------------------------------|--------------------------------------------------------|
+| `Interceptor.read { data -> ... }`               | Observe only — always proceeds with original data      |
+| `Interceptor.transform { data -> modifiedData }` | Maps data before proceeding                            |
+| `Interceptor.full { data, proceed -> ... }`      | Full control: retry, substitute, wrap, gate / filter   |
 
 ```kotlin
 // Logging (read-only)
@@ -766,6 +766,25 @@ Interceptor.full<ApiCall> { call, proceed ->
 `InterceptPoint(Channel.STATE, Direction.UPSTREAM)` and the pre-allocated constants (`InterceptPoint.STATE_UPSTREAM`, `REACTION_DOWNSTREAM`, …) are interchangeable. `InterceptPoint.of(channel, direction)` returns the constant without allocating, and `InterceptPoint.ALL` lists all six.
 
 An interceptor registered for a supertype (e.g. `Any`, a sealed parent or an interface such as `TokenBearer`) also runs for every subtype, merged into the same priority order.
+
+### Blocking (not calling `proceed`)
+
+Interceptors can choose not to call the chain, meaning the value never hits the end — and is **not dispatched**. Whatever the blocking interceptor returns is discarded, and the interceptors after it never run.
+
+| Point                    | Effect of blocking                                                                    |
+|--------------------------|---------------------------------------------------------------------------------------|
+| `(STATE, UPSTREAM)`      | Nothing is emitted; the state keeps its previous value                                |
+| `(REACTION, UPSTREAM)`   | Nothing is emitted                                                                    |
+| `(REQUEST, UPSTREAM)`    | No provider runs (no dedup entry, no concurrency permit); the `Request` flow emits `Loading` and stalls there until its collector is cancelled (or the board is closed, which completes it normally) |
+| `(STATE, DOWNSTREAM)`    | Not delivered; listeners — and the replayed value for new listeners — keep the last value that passed |
+| `(REACTION, DOWNSTREAM)` | Not delivered                                                                         |
+| `(REQUEST, DOWNSTREAM)`  | A blocked `Success(data)` is not emitted; a blocked `Error.staleData` is emitted as `Error(cause, staleData = null)` |
+
+Everything else works as before: the value that is dispatched is the one the chain **returns**, so `transform`, post-processing after `proceed` and retries (calling `proceed` several times) behave as usual — the value is dispatched once, as long as at least one `proceed` call reached the end. Call `proceed` before returning; a call made later (e.g. from a launched coroutine) does not count.
+
+To **replace** a value, pass the substitute on: `proceed(substitute)`. Returning it without proceeding blocks the value instead.
+
+Blocked values are reported to observers via `onBlocked` (not `onData`), so tooling and tests can see gates fire. `InterceptorPipeline.applyInterceptorsOrNull(clazz, data)` exposes the same outcome for direct users of an `InterceptorRegistry` (`null` = blocked); the older `applyInterceptors` returns the chain's result either way.
 
 ### Priorities
 
@@ -823,6 +842,41 @@ passes in is also its identity: request deduplication keys on impulse equality, 
 `hashCode` behind the caller's back, so the next recomposition sees a "different" key and
 re-requests. Returning a copy leaves the caller's instance untouched. The interceptor chain casts
 the result back to the type the value was emitted as, which a `copy()` preserves.
+
+**Auth gate** — requests that need a session never reach their provider without one:
+
+```kotlin
+interface RequiresAuth
+
+data class FetchProfile(val userId: Int) : DataImpulse<UserProfile>(), RequiresAuth
+
+Intercept<RequiresAuth>(
+    point = InterceptPoint.REQUEST_UPSTREAM,
+    interceptor = Interceptor.full { impulse, proceed ->
+        if (session.isValid()) {
+            proceed(impulse)
+        } else {
+            Trigger(NavigateToLogin)
+            impulse // not proceeding: blocked — the provider never runs
+        }
+    },
+)
+```
+
+Without a session the `Request(FetchProfile(…))` flow emits `DataState.Loading` and then just stalls in `Loading` (nothing is sent to the provider) until the requester leaves; with a session it proceeds normally.
+
+**Downstream filter** — only deliver values that pass a predicate:
+
+```kotlin
+Intercept<Order>(
+    point = InterceptPoint.REACTION_DOWNSTREAM, // or STATE_DOWNSTREAM
+    interceptor = Interceptor.full { order, proceed ->
+        if (order.total >= VIP_THRESHOLD) proceed(order) else order // else: filtered out
+    },
+)
+```
+
+`ReactTo<Order>` handlers only see VIP orders. At `STATE_DOWNSTREAM`, `ListenFor<Order>` listeners (and new listeners, via replay) keep the last order that passed; the raw state still holds every broadcast.
 
 **Request logging** — observe all requests without modifying them:
 
@@ -1281,7 +1335,7 @@ CompositionLocalProvider(LocalSwitchBoard provides mySwitchBoard) {
 
 ### Observers
 
-Register any number of read-only observers that fire for **all** data passing through the SwitchBoard, regardless of type, channel, or direction (after that stage's interceptors ran):
+Register any number of read-only observers that fire for **all** data passing through the SwitchBoard, regardless of type, channel, or direction (after that stage's interceptors ran; values an interceptor [blocked](#blocking-not-calling-proceed) go to `onBlocked` instead):
 
 ```kotlin
 val registration = switchBoard.addObserver { point, clazz, data, trace ->
@@ -1292,7 +1346,7 @@ val registration = switchBoard.addObserver { point, clazz, data, trace ->
 registration.unregister()
 ```
 
-`SwitchBoardObserver` is a `fun interface` with `onData(point, clazz, data, trace: TraceContext?)` plus an optional `onDeliveryFailure(point, clazz, data, error)` callback for downstream failures (see [Interceptors → Failures](#failures)).
+`SwitchBoardObserver` is a `fun interface` with `onData(point, clazz, data, trace: TraceContext?)` plus optional callbacks with no-op defaults: `onDeliveryFailure(point, clazz, data, error)` for downstream failures (see [Interceptors → Failures](#failures)) and `onBlocked(point, clazz, data, trace)` for values an interceptor blocked (`data` is the value as it entered the stage). The deprecated `setGlobalLogger` / `setTraceListener` shims only see dispatched values.
 
 - Observers run **synchronously** on the emitting / delivering coroutine, in registration order — keep them fast.
 - An exception thrown by an observer propagates to the stage being observed, just like a throwing read-only interceptor.
@@ -1513,10 +1567,10 @@ flowchart LR
         direction LR
         R1["Interceptor A<br/>priority=0"] --> R2["Interceptor B<br/>priority=5"]
         R2 --> R3["Interceptor C<br/>priority=10"]
-        R3 --> TERM["Terminal<br/>identity fn"]
+        R3 --> TERM["Terminal<br/>(end of chain = dispatch)"]
     end
 
-    TERM --> OUT["Output data<br/>(type T)"]
+    TERM --> OUT["Dispatched data<br/>(the chain's return value)"]
 
     style R1 fill:#e1f5fe
     style R2 fill:#e1f5fe
@@ -1525,10 +1579,12 @@ flowchart LR
 
 Each interceptor receives the data and a `Chain` handle. It can:
 - **Pass through**: `chain.proceed(data)` — observation/logging
-- **Transform**: `chain.proceed(modifiedData)` — mutation before next
-- **Short-circuit**: return a value without calling `proceed` — skip remaining interceptors
+- **Transform**: `chain.proceed(modifiedData)` — mutation before next (or post-process the result of `proceed`)
+- **Block**: return without calling `proceed` — skip remaining interceptors; the terminal is never reached, so the value is not dispatched
 
-Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result together with a pre-built, immutable chain — a steady-state call is one map lookup and allocates no chain objects. A call sees the interceptor set as of its start; registrations made during it apply to later calls.
+Each execution records whether a `proceed` call reached the terminal; if one did, the value the head of the chain returned is dispatched, otherwise the value is blocked. That record is per call, so concurrent executions of the same pipeline never affect each other.
+
+Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result — a steady-state call is one map lookup. A type with no applicable interceptor allocates nothing; otherwise a call allocates a small per-call record and one link per interceptor entered. A call sees the interceptor set as of its start; registrations made during it apply to later calls.
 
 ---
 

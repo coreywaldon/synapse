@@ -5,7 +5,9 @@ import kotlin.reflect.KClass
 /**
  * A read-only listener that is notified of **every** value passing through a
  * [SwitchBoard], on every channel and in both directions, after the
- * interceptors of that stage have run.
+ * interceptors of that stage have run. Values an interceptor **blocked** (did
+ * not pass on with `proceed`) are not dispatched and are reported through
+ * [onBlocked] rather than [onData].
  *
  * Observers are the type-agnostic counterpart to interceptors: use them for
  * logging, metrics, debugging tools or tracing, where registering one
@@ -35,14 +37,17 @@ import kotlin.reflect.KClass
  *
  * ## Evolution
  *
- * This is a `fun interface` with a single abstract method, [onData]. Future
- * notifications will be added as members **with default (no-op)
- * implementations**, so existing observers keep compiling and linking.
+ * This is a `fun interface` with a single abstract method, [onData]. Further
+ * notifications ([onDeliveryFailure], [onBlocked], …) are members **with
+ * default (no-op) implementations**, so existing observers keep compiling and
+ * linking.
  */
 fun interface SwitchBoardObserver {
 
     /**
-     * Called for each value that has passed through the interceptors at [point].
+     * Called for each value that has passed through the interceptors at [point]
+     * and is dispatched. Not called for values an interceptor blocked (see
+     * [onBlocked]).
      *
      * @param point the stage the value was observed at.
      * @param clazz the type token the value travels under (for requests:
@@ -74,4 +79,28 @@ fun interface SwitchBoardObserver {
      * @param error the exception that was thrown.
      */
     fun onDeliveryFailure(point: InterceptPoint, clazz: KClass<*>, data: Any, error: Throwable) {}
+
+    /**
+     * Called when an interceptor at [point] **blocked** a value, i.e. returned
+     * without calling `proceed`, so the end of the chain was never reached and
+     * the value was not dispatched (not emitted, not sent to a provider, or not
+     * delivered to listeners — see [SwitchBoard.addInterceptor]).
+     *
+     * A blocked value is reported here *instead of* through [onData]. Useful
+     * for tooling and tests that want to see gates and filters fire.
+     *
+     * Invoked under the same contract as [onData] (synchronously, in
+     * registration order, exceptions propagate to the stage).
+     *
+     * The default implementation does nothing.
+     *
+     * @param point the stage whose interceptors blocked the value.
+     * @param clazz the type token the value travels under.
+     * @param data  the value **as it entered** the stage; whatever the
+     *              blocking interceptor returned is discarded.
+     * @param trace the [TraceContext] of the stage's coroutine, or `null`
+     *              (see [onData]).
+     * @since 1.1.0
+     */
+    fun onBlocked(point: InterceptPoint, clazz: KClass<*>, data: Any, trace: TraceContext?) {}
 }

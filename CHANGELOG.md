@@ -44,6 +44,39 @@ Node(initialState = MyState()) {
 }
 ```
 
+#### An interceptor that does not call `proceed` now blocks the value
+
+The end of an interceptor chain is now the dispatch. An interceptor that does not call `proceed`
+now **blocks** the value; previously the value it returned was still emitted / routed / sent to
+the provider. This is what the documentation always described ("the value never hits the end"),
+and it makes gates and filters work:
+
+| Point | Blocked value |
+|---|---|
+| `STATE_UPSTREAM` / `REACTION_UPSTREAM` | is not emitted; state keeps its previous value |
+| `REQUEST_UPSTREAM` | never reaches the provider (no provider, no dedup entry, no concurrency permit); the `Request` flow emits `Loading` and stalls there until its collector is cancelled or the board is closed |
+| `STATE_DOWNSTREAM` / `REACTION_DOWNSTREAM` | is not delivered; state listeners and the replay keep the last value that passed |
+| `REQUEST_DOWNSTREAM` | a blocked `Success` is not emitted; a blocked `Error.staleData` is emitted as `Error(cause, staleData = null)` |
+
+Nothing changes for values that reach the end of the chain: the dispatched value is still the one
+the chain returns, so `read`, `transform`, post-processing after `proceed` and retries (several
+`proceed` calls, dispatched once) behave as before. Blocked values are reported to observers via
+the new `SwitchBoardObserver.onBlocked` instead of `onData`, so `setGlobalLogger` /
+`setTraceListener` and arch-test captures no longer see them.
+
+**Migration:** to substitute a value, call `proceed(substitute)` instead of returning it:
+
+```kotlin
+// before: emitted UserState.Guest in place of the original
+Interceptor.full<UserState> { _, _ -> UserState.Guest }
+// after: returning without proceed blocks; pass the substitute on instead
+Interceptor.full<UserState> { _, proceed -> proceed(UserState.Guest) }
+```
+
+`InterceptorPipeline.applyInterceptors` / `InterceptorRegistry.applyInterceptors` are unchanged
+for direct callers: they still return the chain's result, blocked or not. Use the new
+`applyInterceptorsOrNull` to observe the outcome.
+
 #### `DefaultSwitchBoard` owns a child job and can be closed
 
 `DefaultSwitchBoard` now implements `AutoCloseable`. When it is constructed it creates its own
@@ -169,6 +202,16 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
   that throws `UnsupportedOperationException`, so third-party `SwitchBoard` implementations keep
   compiling.
 - `InterceptPoint.of(channel, direction)` (non-allocating) and `InterceptPoint.ALL`.
+- **Interception outcome API:** `InterceptorPipeline.applyInterceptorsOrNull(clazz, data): T?`
+  (and a reified `applyInterceptorsOrNull(data)` extension) returns the value to dispatch, or
+  `null` when an interceptor blocked it. It is an interface member with a default (never blocks,
+  delegates to `applyInterceptors`), so third-party pipelines keep compiling; `InterceptorRegistry`
+  overrides it. The outcome is tracked per execution, so concurrent executions of one pipeline are
+  independent, and a type with no interceptors still allocates nothing.
+- `SwitchBoardObserver.onBlocked(point, clazz, data, trace)` (default no-op): called instead of
+  `onData` when an interceptor blocks a value, with the value as it entered the stage.
+- **arch-test:** `onBlocked<T>(point)` / `captureBlocked(point, type)` return a `CaptureAll<T>`
+  of the values an interceptor blocked at a point.
 - **`SynapseScope`**: common base class of `ContextScope`, `NodeScope`, `CoordinatorScope` and
   `ProviderScope`. It declares the shared verbs once: `Broadcast`, `Trigger`, and the
   flow-returning `ListenFor<O>()`, `ReactTo<A>()` and `Request(impulse)`. `ContextScope` and
@@ -238,9 +281,12 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
 - A downstream interceptor or observer that throws while a state/reaction value is delivered now
   drops that single value. `onDeliveryFailure` is invoked and the error goes to the scope's
   `CoroutineExceptionHandler`. The channel stays alive.
-- The interceptor pipeline pre-builds an immutable chain for each cached snapshot, so a steady-state
-  call allocates no chain objects. An interceptor registered for a supertype also applies to
-  subtypes, merged by priority. `Registration.unregister()` is now truly idempotent.
+- The interceptor pipeline caches the resolved, sorted snapshot per type and runs it as an
+  index-based chain: a steady-state call is one map lookup, a type with no interceptors allocates
+  nothing, and otherwise a call allocates one small per-call record (which tracks whether the end of
+  the chain was reached) plus one link per interceptor entered. An interceptor registered for a
+  supertype also applies to subtypes, merged by priority. `Registration.unregister()` is now truly
+  idempotent.
 - State and reaction channels are stored in per-type lanes, and the interceptor registries in a
   fixed 6-slot array.
 - Provider dedup lookup-or-create is atomic. The losing candidate never invokes its

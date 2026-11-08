@@ -16,8 +16,10 @@ import kotlin.reflect.KClass
  * Hook through which a [ChannelStore] runs a value through the downstream
  * stage of its channel.
  *
- * Returning [DROP] skips the value (e.g. because a downstream interceptor
- * failed); any other value is delivered to the downstream flow.
+ * Returning [DROP] skips the value (because a downstream interceptor blocked
+ * it, or failed); any other value is delivered to the downstream flow. A
+ * dropped value is never emitted downstream, so it does not replace the value
+ * in the downstream flow's replay cache.
  */
 internal fun interface DownstreamStage {
     suspend fun process(point: InterceptPoint, clazz: KClass<*>, value: Any): Any

@@ -10,7 +10,9 @@ import kotlin.reflect.KClass
  *
  * Created by [SynapseTestHarness.onAllImpulses], [SynapseTestHarness.onAllStates],
  * [SynapseTestHarness.onAllRequests], [SynapseTestHarness.onAllRequestResults]
- * and the generic [SynapseTestHarness.captureAll].
+ * and the generic [SynapseTestHarness.captureAll] — or, for values an
+ * interceptor **blocked** at the point instead of dispatching them, by
+ * [SynapseTestHarness.onBlocked] / [SynapseTestHarness.captureBlocked].
  *
  * Values may be recorded from any thread; every read returns a consistent
  * snapshot.
@@ -22,7 +24,11 @@ import kotlin.reflect.KClass
 class CaptureAll<T : Any> internal constructor(
     val point: InterceptPoint,
     val type: KClass<T>,
+    private val blocked: Boolean = false,
 ) {
+
+    /** Where values come from, for assertion messages. */
+    private val where: String get() = if (blocked) "${point.describe()} (blocked)" else point.describe()
 
     /** Guarded by itself. */
     private val list = ArrayList<T>()
@@ -58,7 +64,7 @@ class CaptureAll<T : Any> internal constructor(
     fun assertCount(n: Int) {
         val current = snapshot()
         if (current.size != n) throw AssertionError(
-            "Expected $n captured value(s) at ${point.describe()}, but got ${current.size}: $current"
+            "Expected $n captured value(s) at $where, but got ${current.size}: $current"
         )
     }
 
@@ -70,7 +76,7 @@ class CaptureAll<T : Any> internal constructor(
     fun assertCaptured(): List<T> {
         val current = snapshot()
         if (current.isEmpty()) throw AssertionError(
-            "Expected at least one captured ${type.simpleName ?: type} at ${point.describe()}"
+            "Expected at least one captured ${type.simpleName ?: type} at $where"
         )
         return current
     }
@@ -83,7 +89,7 @@ class CaptureAll<T : Any> internal constructor(
     fun assertNotCaptured() {
         val current = snapshot()
         if (current.isNotEmpty()) throw AssertionError(
-            "Values were captured unexpectedly at ${point.describe()}: $current"
+            "Values were captured unexpectedly at $where: $current"
         )
     }
 
@@ -92,5 +98,5 @@ class CaptureAll<T : Any> internal constructor(
         synchronized(list) { list.clear() }
     }
 
-    override fun toString(): String = "CaptureAll<${type.simpleName}>(${point.describe()}, values=${snapshot()})"
+    override fun toString(): String = "CaptureAll<${type.simpleName}>($where, values=${snapshot()})"
 }
