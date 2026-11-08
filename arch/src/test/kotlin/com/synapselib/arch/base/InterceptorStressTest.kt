@@ -427,4 +427,27 @@ class InterceptorStressTest {
             assertEquals((i + 10) * 2, payload.value, "Payload $i mismatch")
         }
     }
+
+    // ── Idempotent unregister under contention ───────────────────────────
+
+    @Test
+    fun `concurrent unregister calls on one registration remove it exactly once`() = runBlocking {
+        val survivorCalls = AtomicInteger(0)
+        registry.add(Interceptor.read<Payload> { survivorCalls.incrementAndGet() })
+        val target = registry.add(Interceptor.transform<Payload> { it.copy(value = -1) })
+        val before = registry.currentVersion
+
+        withContext(Dispatchers.Default) {
+            coroutineScope {
+                repeat(16) {
+                    launch { repeat(1_000) { target.unregister() } }
+                }
+            }
+        }
+
+        assertEquals(before + 1, registry.currentVersion, "only the first unregister may bump the version")
+        val result = registry.applyInterceptors(Payload("p", value = 5))
+        assertEquals(5, result.value)
+        assertEquals(1, survivorCalls.get())
+    }
 }
