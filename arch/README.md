@@ -576,9 +576,7 @@ class AuthCoordinator(
         // Inject auth token into all outgoing requests
         Intercept<TokenBearer>(
             point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
-            interceptor = Interceptor.transform { impulse ->
-                impulse.apply { token = currentToken }
-            },
+            interceptor = Interceptor.transform { impulse -> impulse.withToken(currentToken) },
         )
 
         // Handle login
@@ -733,7 +731,7 @@ Interceptors execute in ascending priority order (lowest value first). Ties are 
 // Runs first (lowest priority)
 Intercept<TokenBearer>(
     point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
-    interceptor = Interceptor.transform { it.apply { token = currentToken } },
+    interceptor = Interceptor.transform { it.withToken(currentToken) },
     priority = 0,
 )
 
@@ -755,16 +753,32 @@ An exception from an **upstream** interceptor propagates to the producer (the `B
 
 ### Patterns
 
-**Auth token injection** — a single interceptor handles tokens for all outgoing requests:
+**Auth token injection** — a single interceptor handles tokens for all outgoing requests.
+Give the marker interface a copy method, and have the interceptor return a **copy**:
 
 ```kotlin
+interface TokenBearer {
+    val token: String?
+    fun withToken(token: String?): TokenBearer
+}
+
+data class FetchProfile(val userId: Int, override val token: String? = null) :
+    DataImpulse<UserProfile>(), TokenBearer {
+    override fun withToken(token: String?) = copy(token = token)
+}
+
 Intercept<TokenBearer>(
-    point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
-    interceptor = Interceptor.transform { impulse ->
-        impulse.apply { token = tokenManager.current() }
-    },
+    point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
+    interceptor = Interceptor.transform { impulse -> impulse.withToken(tokenManager.current()) },
 )
 ```
+
+Never mutate an impulse in place (e.g. a `var token` set via `apply { }`). The instance a caller
+passes in is also its identity: request deduplication keys on impulse equality, and a Node's
+`Request(impulse)` uses the impulse as its Compose effect key. Mutating it changes `equals` /
+`hashCode` behind the caller's back, so the next recomposition sees a "different" key and
+re-requests. Returning a copy leaves the caller's instance untouched. The interceptor chain casts
+the result back to the type the value was emitted as, which a `copy()` preserves.
 
 **Request logging** — observe all requests without modifying them:
 
