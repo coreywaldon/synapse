@@ -1,6 +1,7 @@
 plugins {
     id("synapse.publish")
     alias(libs.plugins.kotlinCompose)
+    alias(libs.plugins.ksp)
 }
 
 synapsePublishing {
@@ -22,7 +23,16 @@ dependencies {
     implementation(libs.kotlinxSerializationJson)
 
     // The @SynapseProvider KSP processor is published separately as
-    // com.synapselib:arch-processor (:arch-processor). Nothing compile-only belongs here.
+    // com.synapselib:arch-processor (:arch-processor).
+
+    // Run Dagger's processor over arch itself so the jar ships DefaultSwitchBoard_Factory
+    // (as 1.0.x did). Without it, consumers' Dagger generates the factory itself and warns
+    // "Prefer to run the dagger processor over that class", which breaks -Werror builds.
+    // Build-time only: dagger-compiler is a `ksp` dependency and the dagger runtime is
+    // compileOnly — apps that inject DefaultSwitchBoard already have Dagger, and apps that
+    // don't never load the factory class.
+    ksp(libs.daggerCompiler)
+    compileOnly(libs.dagger)
 
     testImplementation(libs.kotlinxCoroutinesTest)
     testImplementation(libs.junitJupiter)

@@ -80,3 +80,23 @@ if (!signingKey.isNullOrBlank()) {
         useInMemoryPgpKeys(signingKey, signingPassword)
     }
 }
+
+// ── Guard: never upload unsigned artifacts to Maven Central ──
+//
+// Maven Central rejects unsigned deployments only *after* upload, so a missing or blank
+// GPG_SIGNING_KEY secret would otherwise turn into a green CI run followed by a failed
+// release. Any task that publishes to the Maven Central repository depends on this check,
+// which fails fast before anything is uploaded. publishToMavenLocal is unaffected.
+val requireSigningKey = tasks.register("requireSigningKey") {
+    group = "publishing"
+    description = "Fails unless GPG_SIGNING_KEY is set; guards every Maven Central publish."
+    val key = providers.environmentVariable("GPG_SIGNING_KEY")
+    doLast {
+        check(!key.orNull.isNullOrBlank()) {
+            "GPG_SIGNING_KEY is not set: refusing to publish unsigned artifacts to Maven Central."
+        }
+    }
+}
+tasks.matching { it.name.contains("MavenCentral") }.configureEach {
+    dependsOn(requireSigningKey)
+}

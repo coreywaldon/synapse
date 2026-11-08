@@ -149,7 +149,9 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
 - **core:** `DerivedStateFlow` (the result of `and`, `or`, `not`, …) no longer emits equal
   consecutive values, as the `StateFlow` contract requires.
 - **arch:** `DefaultSwitchBoard`'s 5-parameter `@Inject` constructor is now a secondary
-  constructor. Hilt injection and call sites are unchanged.
+  constructor. Hilt injection and call sites are unchanged, and the `arch` jar still ships the
+  Dagger-generated `DefaultSwitchBoard_Factory` (Dagger now runs over `arch` via KSP at build
+  time only — no Dagger artifact is added to `arch`'s runtime dependencies).
 
 ### Added
 
@@ -194,6 +196,10 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
 
 ### Changed
 
+- **Publishing to Maven Central now refuses to run without `GPG_SIGNING_KEY`** (new
+  `requireSigningKey` task guarding every `*MavenCentral*` publish task), instead of uploading
+  unsigned artifacts that Central rejects after the fact. `publishToMavenLocal` needs no key.
+- The demo app now depends on `arch-processor` (KSP) and `arch-hilt` (registry aggregation).
 - **POM license is now MPL 2.0**, matching the repository's `LICENSE` file. 1.0.x POMs wrongly
   declared Apache 2.0.
 - `arch` now exposes `core`, `kotlinx-coroutines-core`, Compose runtime, `lifecycle-common` and
