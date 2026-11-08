@@ -38,7 +38,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 - [Core Types](#-core-types) — `Impulse`, `DataImpulse`, `DataState`, `SwitchBoard`
 
 **Deep dive**
-- [Observability](#-observability) — global logger, `TraceContext`
+- [Observability](#-observability) — observers, `TraceContext`
 - [Architecture Diagrams](#-architecture-diagrams)
 - [Performance](#performance) — benchmark numbers
 
@@ -57,7 +57,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 - **Cross-cutting concerns as first-class operations** — auth token injection, analytics, session management are interceptors, not bolted onto a repository layer.
 - **Real-bus testing, no mocks** — [synapse-arch-test](../arch-test/README.md) runs tests through the actual SwitchBoard with interceptor-based capture.
 - **Compose-native** — `CreateContext` + `Node` replace the ViewModel entirely; no ceremony.
-- **KSP-wired DI** — `@SynapseProvider` + Hilt or Koin, multi-module out of the box via [synapse-arch-hilt](../arch-hilt/README.md).
+- **KSP-wired DI** — `@SynapseProvider` + [arch-processor](../arch-processor/README.md) for Hilt or Koin, multi-module out of the box via [synapse-arch-hilt](../arch-hilt/README.md).
 - **Benchmarked** — ~200 ns overhead per SwitchBoard op, ~20 µs per Node in Compose composition, linear scaling at every layer. See [Performance](#performance).
 - **Honest about trade-offs** — full comparison vs MVVM/MVI/RIBs/Circuit at the bottom: [How Synapse Compares](#-how-synapse-compares).
 
@@ -95,7 +95,8 @@ dependencies {
 > compile-only artifact, [`arch-processor`](../arch-processor/README.md). Replace
 > `ksp("com.synapselib:arch:<version>")` with `ksp("com.synapselib:arch-processor:<version>")`.
 > `arch` no longer drags `dagger-compiler`, KSP, AutoService or Compose Foundation onto your runtime
-> classpath — if your app relied on any of them transitively, declare them directly.
+> classpath — if your app relied on any of them transitively, declare them directly. See the
+> [CHANGELOG](../CHANGELOG.md) for the other 1.1.0 behavior changes.
 
 ---
 
@@ -251,14 +252,15 @@ fun CheckoutScreen(appServices: AppServices) {
             }
 
             // UI — no callbacks passed down
-            CheckoutContent(state = state)
+            CheckoutContent()
         }
     }
 }
 
-// Child composable as a ContextScope extension — gives bus access without prop drilling
+// Child composable as a NodeScope extension — bus access plus the Node's `state` / `update`,
+// without prop drilling
 @Composable
-fun ContextScope<AppServices>.CheckoutContent(state: CheckoutState) {
+fun NodeScope<AppServices, CheckoutState>.CheckoutContent() {
     val addresses = state.addresses.dataOrNull.orEmpty()
 
     // Local state — update directly from click handler, no impulse needed
@@ -286,9 +288,9 @@ fun ContextScope<AppServices>.CheckoutContent(state: CheckoutState) {
 }
 ```
 
-**No callback threading.** Bus-aware child composables (ContextScope extensions) should never receive `onSomething` lambdas that thread state changes back to a parent Node. Instead, children fire impulses through the bus via `Trigger()`, and the Node reacts to them with `ReactTo`. This keeps components decoupled — they communicate through typed impulses, not callback chains.
+**No callback threading.** Bus-aware child composables (`ContextScope` / `NodeScope` extensions) should never receive `onSomething` lambdas that thread state changes back to a parent Node. Instead, children fire impulses through the bus via `Trigger()`, and the Node reacts to them with `ReactTo`. This keeps components decoupled — they communicate through typed impulses, not callback chains.
 
-Passing **read-only display data** as parameters is fine. Passing lambdas to **pure UI leaf components** (things like `AddressRow`, `Button` — not ContextScope extensions) is also fine, since they don't participate in the bus.
+Passing **read-only display data** as parameters is fine. Passing lambdas to **pure UI leaf components** (things like `AddressRow`, `Button` — not scope extensions) is also fine, since they don't participate in the bus.
 
 ```kotlin
 // Anti-pattern: callback threading
@@ -298,7 +300,7 @@ CheckoutContent(
 
 // Correct: pass read-only data, child fires impulses directly
 ProductCard(isFavorited = true, quantityInCart = 3)  // ✅ read-only data as params
-scope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }  // ✅ child fires impulse
+coroutineScope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }  // ✅ child fires impulse
 ```
 
 **Use impulses for cross-component communication.** Use `update` directly for screen-local state changes (e.g., selecting an address, toggling a filter). Only create an impulse when the action needs to cross component boundaries.
@@ -351,25 +353,39 @@ Creates a stateful node inside a `ContextScope`. The fundamental unit of the Com
 
 **NodeScope capabilities:**
 
-| Category              | Method                                    | Composable? |
-|-----------------------|-------------------------------------------|-------------|
-| **Local state**       | `update { reducer }`                      | No          |
-| **State broadcast**   | `Broadcast(data)`                         | No (suspend)|
-| **Reactions**         | `Trigger(event)`                          | No (suspend)|
-| **Interception**      | `Intercept(point, interceptor, priority)` | No          |
-| **Request**           | `Request(impulse, key) { handler }`       | Yes         |
-| **Listen (state)**    | `ListenFor(stateKey) { handler }`         | Yes         |
-| **Listen (reaction)** | `ReactTo(reactionKey) { handler }`        | Yes         |
+| Category                       | Method                                         | Composable?  |
+|--------------------------------|------------------------------------------------|--------------|
+| **Local state**                | `update { reducer }`                           | No           |
+| **State broadcast**            | `Broadcast(data)`                              | No (suspend) |
+| **Reactions**                  | `Trigger(event)`                               | No (suspend) |
+| **Interception**               | `Intercept(point, interceptor, priority, key)` | Yes          |
+| **Interception (imperative)**  | `addInterceptor(point, interceptor, priority)` → `Registration` | No |
+| **Request**                    | `Request(impulse, key) { handler }`            | Yes          |
+| **Listen (state)**             | `ListenFor(stateKey) { handler }`              | Yes          |
+| **Listen (reaction)**          | `ReactTo(reactionKey) { handler }`             | Yes          |
+| **Flows**                      | `ListenFor<O>()`, `ReactTo<A>()`, `Request(impulse)` | No — return flows |
 
 **Properties:**
 
-| Property  | Type             | Purpose                                                            |
-|-----------|------------------|--------------------------------------------------------------------|
-| `context` | `C`              | Read-only access to the value from `CreateContext`                 |
-| `state`   | `S`              | Current snapshot of local state (triggers recomposition on change) |
-| `scope`   | `CoroutineScope` | For launching coroutines (e.g., to `Trigger` from click handlers) |
+| Property      | Type             | Purpose                                                            |
+|---------------|------------------|--------------------------------------------------------------------|
+| `context`     | `C`              | Read-only access to the value from `CreateContext`                 |
+| `state`       | `S`              | Current snapshot of local state (triggers recomposition on change) |
+| `scope`       | `CoroutineScope` | For launching coroutines (e.g., to `Trigger` from click handlers) |
+| `switchboard` | `SwitchBoard`    | The board inherited from the enclosing `ContextScope`              |
+| `tag`         | `String?`        | The trace tag inherited from the enclosing `ContextScope`          |
+| `isDisposed`  | `Boolean`        | `true` once the Node has left the composition                      |
 
-**ContextScope extensions** — the standard pattern for child composables. Declaring a composable as a `ContextScope<T>` extension gives it access to `context`, `scope`, `Trigger`, `Broadcast`, and `update` without prop drilling:
+**Shared verbs.** `ContextScope`, `NodeScope`, `CoordinatorScope` and `ProviderScope` all extend `SynapseScope`, which implements `Broadcast`, `Trigger` and the flow-returning `ListenFor<O>()`, `ReactTo<A>()` and `Request(impulse)` once. You can write reusable helpers against it:
+
+```kotlin
+suspend fun SynapseScope.announceLogin(user: User) {
+    Broadcast(SessionState.Authenticated(user))
+    Trigger(NavigateTo("home"))
+}
+```
+
+**Scope extensions** — the standard pattern for child composables. Declaring a composable as a `ContextScope<T>` extension gives it `context`, `coroutineScope` (composition-bound), `Trigger`, `Broadcast` and the flow verbs without prop drilling. When the child also needs the Node's `state` / `update`, declare it as a `NodeScope<C, S>` extension instead (as `CheckoutContent` does above).
 
 ```kotlin
 // Child composable — extension on ContextScope gives bus access
@@ -378,7 +394,7 @@ fun ContextScope<Product>.ProductCard() {
     val product = context  // typed access to the Product from CreateContext
     Card(
         modifier = Modifier.clickable {
-            scope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }
+            coroutineScope.launch { Trigger(Cart.AddItem(product.id, qty = 1)) }
         }
     ) {
         Text(product.name)
@@ -387,9 +403,30 @@ fun ContextScope<Product>.ProductCard() {
 }
 ```
 
-`Trigger` and `Broadcast` are suspend functions. Use `scope.launch { }` from non-suspend contexts like click handlers.
+`Trigger` and `Broadcast` are suspend functions. Use `scope.launch { }` (in a `NodeScope`) or `coroutineScope.launch { }` (in a `ContextScope`) from non-suspend contexts like click handlers.
 
-**Lifecycle-aware subscriptions** (`ListenFor`, `ReactTo`, `Request`) use `DisposableEffect` internally — canceled and relaunched when their key changes, canceled when the composable exits.
+**Lifecycle-aware effects** (`ListenFor`, `ReactTo`, `Request`, `Intercept`) use `DisposableEffect` internally — canceled and relaunched when their key changes, canceled when the composable exits.
+
+**Interceptors in a Node.** `Intercept` is `@Composable`. It registers its interceptor **once** per distinct (`point`, `priority`, `key`) and removes it when the call leaves the composition. Recomposition doesn't re-register, and the latest `interceptor` lambda is always the one invoked, so it is safe to capture fresh state. Outside the composable body (click handlers, effects, coroutines), use `addInterceptor`. It registers on every call, returns a `Registration`, and is unregistered automatically when the Node is disposed:
+
+```kotlin
+Node(initialState = ScreenState()) {
+    // Composable body: registered once, follows the latest `state`
+    Intercept<NetworkRequest>(
+        point = InterceptPoint.REQUEST_UPSTREAM,
+        interceptor = Interceptor.transform { req -> req.copy(token = state.authToken) },
+    )
+
+    // Imperative: from an effect or callback
+    LaunchedEffect(userId) {
+        val registration = addInterceptor<AnalyticsEvent>(
+            InterceptPoint.REACTION_UPSTREAM,
+            Interceptor.transform { it.copy(userId = userId) },
+        )
+        try { awaitCancellation() } finally { registration.unregister() }
+    }
+}
+```
 
 **State persistence**: If `S` has a `@Serializable` annotation (kotlinx.serialization), state is automatically saved/restored across configuration changes via `rememberSaveable`.
 
@@ -440,7 +477,7 @@ val coordinator = Coordinator(switchboard, lifecycleOwner) {
 }
 ```
 
-Auto-disposes on `ON_DESTROY`. Call `coordinator.dispose()` for earlier cleanup (idempotent).
+Auto-disposes on `ON_DESTROY`. Call `coordinator.dispose()` for earlier cleanup (idempotent, thread-safe). If the owner is already `DESTROYED`, the coordinator is disposed immediately, and if the block throws, it is disposed before the exception is rethrown.
 
 Optional `tag` parameter enables [tracing](#-observability):
 
@@ -466,7 +503,30 @@ Coordinator(switchboard, lifecycleOwner) {
 
 Available hooks: `onCreate`, `onStart`, `onResume`, `onPause`, `onStop`, `onDestroy`.
 
-Multiple callbacks for the same event execute in registration order. All callbacks are cleared on `dispose()`.
+Hooks behave the same no matter *when* they are registered:
+
+- **Up-events** (`onCreate`, `onStart`, `onResume`) whose state the owner has **already reached** fire immediately, then again on every later occurrence. The builder attaches its lifecycle observer *after* the block, so hooks registered in the block are replayed in lifecycle order. With an already-resumed owner such as `ProcessLifecycleOwner`, `onStart { }` fires right after the block.
+- **Down-events** (`onPause`, `onStop`, `onDestroy`) are never replayed; they fire the next time the event happens.
+- Multiple callbacks for the same event execute in registration order. Hooks registered after `dispose()` are ignored.
+
+### Teardown: `onDispose` and `isDisposed`
+
+`onDispose { }` runs exactly once when the coordinator is disposed — manually, on `ON_DESTROY` (after the `onDestroy` hooks), or because its parent scope was canceled. If the coordinator is already disposed, the callback runs immediately. `isDisposed` reports the current state.
+
+`dispose()` cancels the coordinator's job and every handler/listener job, unregisters every `Intercept`, clears the lifecycle hooks, removes the lifecycle observer and runs the `onDispose` callbacks. Registrations made after (or concurrently with) disposal are cleaned up immediately, so nothing leaks. Construct lifecycle-bound coordinators on the main thread (`LifecycleRegistry` requires it).
+
+### Lifecycle-free Coordinators
+
+For app-wide or background work with no Android lifecycle, bind the coordinator to a `CoroutineScope` instead of a `LifecycleOwner`:
+
+```kotlin
+val sync = Coordinator(switchboard, applicationScope, tag = "SyncCoordinator") {
+    ReactTo<SyncRequested> { launch { Broadcast(syncEngine.run()) } }
+    onDispose { syncEngine.close() }
+}
+```
+
+The coordinator runs in a `SupervisorJob` child of the scope's job and is disposed automatically when that scope is canceled. Disposing it never cancels the scope. Like any child job, it keeps a *normally completing* parent alive until disposed. Lifecycle hooks (`onStart`, `onStop`, …) **throw `IllegalStateException`** on a lifecycle-free coordinator, because they could never fire; use `onDispose` instead. `lifecycleOwner` is `null` for these coordinators.
 
 ### Flow vs Handler overloads
 
@@ -661,6 +721,10 @@ Interceptor.full<ApiCall> { call, proceed ->
 | `(REQUEST, UPSTREAM)`    | Before request params reach the ProviderManager        |
 | `(REQUEST, DOWNSTREAM)`  | After the provider produces a result, before emission   |
 
+`InterceptPoint(Channel.STATE, Direction.UPSTREAM)` and the pre-allocated constants (`InterceptPoint.STATE_UPSTREAM`, `REACTION_DOWNSTREAM`, …) are interchangeable. `InterceptPoint.of(channel, direction)` returns the constant without allocating, and `InterceptPoint.ALL` lists all six.
+
+An interceptor registered for a supertype (e.g. `Any`, a sealed parent or an interface such as `TokenBearer`) also runs for every subtype, merged into the same priority order.
+
 ### Priorities
 
 Interceptors execute in ascending priority order (lowest value first). Ties are broken by insertion order (FIFO).
@@ -683,7 +747,11 @@ Intercept<TokenBearer>(
 
 ### `Registration`
 
-`addInterceptor` returns a `Registration` handle. Call `unregister()` to remove. Idempotent — safe to call multiple times.
+`addInterceptor` returns a `Registration` handle. Call `unregister()` to remove. Idempotent — safe to call multiple times. Registrations made through `CoordinatorScope.Intercept` or `NodeScope.addInterceptor` are also tracked and unregistered when the coordinator / node is disposed.
+
+### Failures
+
+An exception from an **upstream** interceptor propagates to the producer (the `Broadcast` / `Trigger` caller, or the `Request` collector). If a **downstream** state/reaction interceptor throws, that single value is dropped and listeners keep their previous value. Observers get `onDeliveryFailure`, and the exception goes to the board scope's `CoroutineExceptionHandler`. The channel stays alive for later values.
 
 ### Patterns
 
@@ -764,7 +832,7 @@ Providers execute inside a `ProviderScope` with full SwitchBoard access:
 | `Trigger(event)`            | Fires a reaction impulse                     |
 | `Request<Need, I>(impulse)` | Issues a nested data request                 |
 
-ProviderScope provides **flow overloads only** — no handler overloads. Use `.collect`, `.first()`, etc. to consume flows.
+ProviderScope provides **flow overloads only** — no handler overloads. Use `.collect`, `.first()`, etc. to consume flows. It is also a `CoroutineScope` (cancelled with the provider job), so `launch { Trigger(...) }` works inside `produce`. A launched coroutine that fails is reported to the provider's collectors as `DataState.Error`; it does not escape to the app's exception handler.
 
 ```kotlin
 // Provider that reads auth state
@@ -788,9 +856,15 @@ class WatchCartProvider @Inject constructor(
 }
 ```
 
-### Job deduplication
+### Job deduplication & lifetime
 
 Active requests are keyed by `DataImpulse` structural equality. Two `FetchProducts(id=1)` impulses share the same in-flight job and `DataState` flow. Two `FetchProducts(id=1)` and `FetchProducts(id=2)` run concurrently.
+
+- **Dedup is atomic and only covers live jobs.** Concurrent equal requests always resolve to exactly one provider. Once a one-shot provider completes, its entry is removed and the next equal request runs the provider again. Collectors of the completed flow still see the replayed terminal state.
+- **The provider starts on first collection.** A job waits for its first collector before calling `produce`, so collectors always observe `DataState.Loading`.
+- **Idle teardown.** Each returned flow counts its collectors. When a job has had no collectors for the idle timeout, it is cancelled and its entry evicted. This applies both to requests that are never collected and to streaming providers whose last subscriber left. Resubscribing within the window keeps the same provider running. Collecting a flow whose job was already torn down transparently re-requests. On `DefaultSwitchBoard` the timeout is `SwitchBoardConfig.providerIdleTimeout` (defaults to `stopTimeout`, 3 s; `Duration.INFINITE` disables teardown).
+- **Super-type callers share the job.** The job is typed by the provider's registered `Need`, so requesting the same impulse as `Any` and as `UserProfile` shares one provider. A `Need` that isn't a super-type of the provider's result fails with a descriptive `IllegalArgumentException`.
+- **Concurrency limit.** `SwitchBoardConfig.maxConcurrentJobs` bounds the number of live jobs (`0` = unbounded). Over the limit, the request emits `DataState.Error(ProviderConcurrencyException)`.
 
 ### ProviderRegistry
 
@@ -806,19 +880,20 @@ val registry = ProviderRegistry.Builder()
 Multi-module composition:
 
 ```kotlin
-val registry = ProviderRegistry.Builder()
-    .mergeFrom(featureARegistry)
-    .mergeFrom(featureBRegistry)
-    .build()
+val registry = ProviderRegistry.of(featureARegistry, featureBRegistry)
+// or: featureARegistry + featureBRegistry
+// or: ProviderRegistry.Builder().mergeFrom(featureARegistry).mergeFrom(featureBRegistry).build()
 ```
 
-`ProviderRegistry.EMPTY` is available for tests.
+Each `DataImpulse` type may have exactly one provider. A duplicate throws `IllegalStateException` naming both conflicting factories. Give a builder a name (`ProviderRegistry.Builder(name = "feature-cart")`) and the error also says which registry each factory came from.
+
+`ProviderRegistry.EMPTY` is available for tests; `hasProvider(type)`, `registeredImpulseTypes()` and `size` help with assertions.
 
 ### KSP Code Generation
 
 #### Hilt
 
-KSP generates a `SynapseProviderModule_{ModuleName}` per Gradle module that contributes a `ProviderRegistryContribution` via Hilt multibinding (`@IntoSet`). The **`arch-hilt`** artifact provides an aggregator module that collects all contributions and merges them into a single `ProviderRegistry` singleton.
+When Hilt is on the compile classpath, [arch-processor](../arch-processor/README.md) generates a `SynapseProviderModule_{ModuleName}` per Gradle module that contributes a `ProviderRegistryContribution` via Hilt multibinding (`@IntoSet`). The **`arch-hilt`** artifact provides an aggregator module that collects all contributions and merges them into a single `ProviderRegistry` singleton.
 
 This means providers can live in separate Gradle modules and are automatically discovered — no manual wiring required.
 
@@ -867,7 +942,7 @@ object SynapseProviderModule_FeatureAuth {
 }
 ```
 
-The `SynapseProviderAggregatorModule` (from `arch-hilt`) automatically collects all contributions and provides the merged `ProviderRegistry`. If two modules register a provider for the same `DataImpulse` type, the app will fail at startup with a clear duplicate message.
+The `SynapseProviderAggregatorModule` (from `arch-hilt`) automatically collects all contributions and provides the merged `ProviderRegistry`. If two modules register a provider for the same `DataImpulse` type, the app fails at startup with an `IllegalStateException` naming both provider factories.
 
 See the [arch-hilt README](../arch-hilt/README.md) for full details.
 
@@ -877,19 +952,23 @@ See the [arch-hilt README](../arch-hilt/README.md) for full details.
 @UninstallModules(SynapseProviderModule_FeatureAuth::class)
 @HiltAndroidTest
 class MyTest {
-    @BindValue
-    val registry = ProviderRegistry.Builder()
-        .register<UserProfile, FetchUserProfile> { FakeProvider() }
-        .build()
+    // Replaces FeatureAuth's contribution; the aggregator still merges every other module.
+    @BindValueIntoSet
+    @JvmField
+    val fakes = ProviderRegistryContribution(
+        ProviderRegistry.Builder(name = "fakes")
+            .register<UserProfile, FetchUserProfile> { FakeProvider() }
+            .build()
+    )
 }
 ```
 
 #### Koin
 
-KSP generates `synapseProviderModule_{ModuleName}`:
+When Hilt is not on the classpath, KSP generates a Koin module named `synapseProviderModule_{ModuleName}` (`synapseProviderModule_App` by default):
 
 ```kotlin
-val synapseProviderModule_app = module {
+val synapseProviderModule_App = module {
     factory { get<FetchUserProfileProvider>() }
     factory { get<SearchProductsProvider>() }
 
@@ -909,9 +988,11 @@ Usage:
 
 ```kotlin
 startKoin {
-    modules(synapseProviderModule_app)
+    modules(synapseProviderModule_App)
 }
 ```
+
+Each generated Koin module declares its own `single<ProviderRegistry>` and there is no Koin aggregator, so in multi-module Koin apps declare the merged registry yourself (see the [arch-hilt README](../arch-hilt/README.md#koin)).
 
 ### Patterns
 
@@ -1033,7 +1114,7 @@ Extensions: `dataOrNull` extracts `Success.data` or returns `null`. `isLoading` 
 
 ### `SwitchBoard` (interface)
 
-The central contract. All cross-component communication flows through this interface. Callers rarely interact with it directly — `NodeScope` and `CoordinatorScope` provide typed wrappers.
+The central contract. All cross-component communication flows through this interface. Callers rarely interact with it directly — the DSL scopes (`NodeScope`, `CoordinatorScope`, …) provide typed wrappers.
 
 | Method                                                | Purpose                                                                       |
 |-------------------------------------------------------|-------------------------------------------------------------------------------|
@@ -1045,6 +1126,9 @@ The central contract. All cross-component communication flows through this inter
 | `getRawStateFlow(clazz)`                              | Returns the raw (unintercepted) state flow                                    |
 | `getRawImpulseFlow(clazz)`                            | Returns the raw (unintercepted) reaction flow                                 |
 | `addInterceptor(point, clazz, interceptor, priority)` | Registers an interceptor at a specific channel/direction point                |
+| `addObserver(observer)`                               | Registers a type-agnostic, read-only [observer](#-observability) of every stage |
+
+`addObserver` has a default implementation that throws `UnsupportedOperationException`, so custom `SwitchBoard` implementations and test fakes keep compiling; `DefaultSwitchBoard` supports it.
 
 Reified extension functions are provided for all methods so callers rarely need to pass `KClass` tokens manually:
 
@@ -1058,19 +1142,58 @@ switchboard.broadcastState(profile)
 
 ### `DefaultSwitchBoard`
 
-The concrete `SwitchBoard` implementation. Injectable via Hilt (`@Inject constructor`).
+The concrete `SwitchBoard` implementation, configured with an immutable `SwitchBoardConfig`:
 
-**Constructor parameters:**
+```kotlin
+// All defaults
+val board = DefaultSwitchBoard(scope, registry)
 
-| Parameter                | Qualifier                      | Default          | Purpose                                                         |
-|--------------------------|--------------------------------|------------------|-----------------------------------------------------------------|
-| `scope`                  | `@SwitchBoardScope`            | —                | Parent `CoroutineScope` for `shareIn` and provider jobs         |
-| `providerRegistry`       | —                              | —                | Immutable impulse→factory mappings                              |
-| `workerContext`          | `@SwitchBoardWorkerContext`    | `Dispatchers.IO` | Coroutine context for provider execution                        |
-| `stopTimeoutMillis`      | `@SwitchBoardStopTimeout`      | 3000ms           | `WhileSubscribed` stop timeout for downstream shared flows      |
-| `replayExpirationMillis` | `@SwitchBoardReplayExpiration` | 3000ms           | `WhileSubscribed` replay expiration for downstream shared flows |
+// Configured
+val board = DefaultSwitchBoard(scope, registry, SwitchBoardConfig {
+    stopTimeout = 5.seconds
+    maxConcurrentJobs = 8
+    workerContext = Dispatchers.Default
+})
 
-Call `setEagerSharing()` before any flow is consumed to switch from lazy `WhileSubscribed` to `SharingStarted.Eagerly` — intended for testing.
+// Tests: keep downstream flows hot regardless of subscribers
+val testConfig = productionConfig.copy { eagerSharing() }
+```
+
+**`SwitchBoardConfig` options:**
+
+| Option                   | Default                                       | Purpose                                                                       |
+|--------------------------|-----------------------------------------------|-------------------------------------------------------------------------------|
+| `stopTimeout`            | 3 s                                           | How long a downstream flow keeps sharing after its last subscriber leaves     |
+| `replayExpiration`       | 3 s                                           | How long a downstream flow keeps its replay cache after sharing stops         |
+| `sharingStarted`         | `WhileSubscribed(stopTimeout, replayExpiration)` | Overrides the sharing strategy; `eagerSharing()` sets `SharingStarted.Eagerly` |
+| `reactionBufferCapacity` | 64                                            | Extra buffer per reaction channel to absorb bursts                            |
+| `reactionOverflow`       | `BufferOverflow.DROP_OLDEST`                  | Behavior when a reaction buffer is full (`SUSPEND` applies back-pressure)     |
+| `maxConcurrentJobs`      | 0 (unbounded)                                 | Maximum number of live provider jobs                                          |
+| `providerIdleTimeout`    | `stopTimeout`                                 | Idle time before a provider job with no collectors is cancelled; `Duration.INFINITE` disables |
+| `workerContext`          | `Dispatchers.IO`                              | Coroutine context providers run in                                            |
+
+Values are validated when the config is built; an out-of-range value throws `IllegalArgumentException`. `reactionBufferCapacity = 0` requires `reactionOverflow = SUSPEND`.
+
+**Dependency injection.** A secondary `@Inject` constructor takes the qualified loose parameters and is equivalent to a config with those values (everything else at defaults):
+
+| Parameter                | Qualifier                      | Default          | Maps to                    |
+|--------------------------|--------------------------------|------------------|----------------------------|
+| `scope`                  | `@SwitchBoardScope`            | —                | parent scope               |
+| `providerRegistry`       | —                              | —                | the providers              |
+| `workerContext`          | `@SwitchBoardWorkerContext`    | `Dispatchers.IO` | `workerContext`            |
+| `stopTimeoutMillis`      | `@SwitchBoardStopTimeout`      | 3000ms           | `stopTimeout`              |
+| `replayExpirationMillis` | `@SwitchBoardReplayExpiration` | 3000ms           | `replayExpiration`         |
+
+To use other options with Hilt, `@Provides` the board yourself with `DefaultSwitchBoard(scope, registry, SwitchBoardConfig { ... })`.
+
+**Lifecycle.** The board runs its sharing coroutines and provider jobs under its **own** `SupervisorJob`, a child of `scope`. It implements `AutoCloseable`:
+
+- `close()` disposes all provider jobs and cancels the board's job. It does **not** cancel `scope`. It is idempotent; `isClosed` reports it.
+- After `close()`, `broadcastState`, `triggerImpulse`, `handleRequest`, `stateFlow`, `impulseFlow` and the raw-flow accessors throw `IllegalStateException`. Flows obtained earlier simply stop receiving values (a `SharedFlow` never completes), so cancel their collectors through their own lifecycle. Registering interceptors or observers is still allowed but has no effect.
+- Cancelling `scope` also stops the board's coroutines (without marking it closed); requests then emit `DataState.Error(IllegalStateException)`.
+- Because the board's job is a child of `scope`, a scope that waits for its children (e.g. `runTest`'s `TestScope`) does not complete until the board is closed — use `DefaultSwitchBoard(this, registry).use { ... }` or pass `backgroundScope` in tests.
+
+`setEagerSharing()` is deprecated: it throws if called after the first `stateFlow` / `impulseFlow`. Use `SwitchBoardConfig { eagerSharing() }`.
 
 ### `LocalSwitchBoard`
 
@@ -1087,19 +1210,36 @@ CompositionLocalProvider(LocalSwitchBoard provides mySwitchBoard) {
 
 ## 🔍 Observability
 
-### Global Logger
+### Observers
 
-Register a read-only logger that fires for **all** data passing through the SwitchBoard, regardless of type, channel, or direction:
+Register any number of read-only observers that fire for **all** data passing through the SwitchBoard, regardless of type, channel, or direction (after that stage's interceptors ran):
 
 ```kotlin
-switchBoard.setGlobalLogger { point, clazz, data ->
-    Log.d("SwitchBoard", "[$point] ${clazz.simpleName}: $data")
+val registration = switchBoard.addObserver { point, clazz, data, trace ->
+    Log.d("SwitchBoard", "[$point] ${clazz.simpleName}: $data (from ${trace?.emitterTag})")
 }
+
+// later
+registration.unregister()
 ```
 
-Pass `null` to remove. Signature: `(InterceptPoint, KClass<*>, Any) -> Unit`.
+`SwitchBoardObserver` is a `fun interface` with `onData(point, clazz, data, trace: TraceContext?)` plus an optional `onDeliveryFailure(point, clazz, data, error)` callback for downstream failures (see [Interceptors → Failures](#failures)).
 
-For type-specific logging, use `addLoggingInterceptors<T>` which registers read-only interceptors at all 6 intercept points:
+- Observers run **synchronously** on the emitting / delivering coroutine, in registration order — keep them fast.
+- An exception thrown by an observer propagates to the stage being observed, just like a throwing read-only interceptor.
+- With no observers registered, the board pays no observation cost at all (not even a coroutine-context lookup).
+
+`setGlobalLogger` and `setTraceListener` still work but are deprecated single-slot shims over observers; migrate with:
+
+```kotlin
+// setGlobalLogger { point, clazz, data -> ... }
+switchBoard.addObserver { point, clazz, data, _ -> /* ... */ }
+
+// setTraceListener { trace, point, clazz, data -> ... }
+switchBoard.addObserver { point, clazz, data, trace -> if (trace != null) { /* ... */ } }
+```
+
+For type-specific logging, use `addLoggingInterceptors<T>` which registers read-only interceptors at all 6 intercept points and returns a single `Registration`:
 
 ```kotlin
 switchBoard.addLoggingInterceptors<UserProfile> { profile ->
@@ -1109,7 +1249,7 @@ switchBoard.addLoggingInterceptors<UserProfile> { profile ->
 
 ### TraceContext (opt-in origin tracing)
 
-When a `Coordinator` or `CreateContext` is given a `tag`, every `Trigger` and `Broadcast` call automatically attaches a `TraceContext` to the coroutine context. The SwitchBoard reads this in `processAndLog` and invokes the trace listener.
+When a `CreateContext`, `Coordinator` or `ProviderScope` is given a `tag`, every `Broadcast`, `Trigger` and `Request` made through it runs inside a **new** `TraceContext` (`emitterTag = tag`). Observers receive it as their `trace` argument. A `Node` inherits the tag of its `CreateContext`.
 
 ```kotlin
 // Tag your components
@@ -1117,22 +1257,37 @@ val coordinator = Coordinator(switchboard, owner, tag = "AuthCoordinator") { ...
 
 CreateContext(appServices, tag = "CheckoutScreen") { ... }
 
-// Listen for traces
-switchBoard.setTraceListener { trace, point, clazz, data ->
-    Log.d("Trace", "[${trace.emitterTag}] $point ${clazz.simpleName}: $data")
+// Observe traces
+switchBoard.addObserver { point, clazz, data, trace ->
+    if (trace != null) Log.d("Trace", "[${trace.emitterTag}] ${trace.traceId} ← ${trace.parentTraceId} $point ${clazz.simpleName}")
 }
 ```
 
-`TraceContext` is a `CoroutineContext.Element` — it never enters the `SharedFlow`. Interceptors and consumers still see raw `T`. When `tag` is `null` (the default), no `TraceContext` is created and zero overhead is incurred.
+`TraceContext` is a `CoroutineContext.Element` — it never enters the `SharedFlow`. Interceptors and consumers still see raw `T`. When `tag` is `null` (the default), the scope is **transparent**: no `TraceContext` is created, no context lookup happens, and an ambient trace (if any) is reported unchanged.
+
+**Causal chains.** If the calling coroutine already carries a `TraceContext`, a tagged emission's `parentTraceId` is that trace's `traceId`. Following parent links rebuilds the chain of emissions made within a coroutine and the coroutines it launches. `withTrace` installs a linked trace around a block, and `currentTraceContext()` reads the current one:
+
+```kotlin
+withTrace("CheckoutFlow") {
+    Broadcast(CartLocked)          // untagged scope: reported with CheckoutFlow's trace
+    taggedCoordinator.Trigger(Pay) // tagged scope: new trace, parentTraceId = CheckoutFlow's traceId
+}
+```
+
+For a tagged `Request`, upstream interception of the impulse and downstream interception of each result run inside the trace (linked to the collector's ambient trace).
+
+**What is not propagated.** Traces do not cross the SwitchBoard hop. A `ListenFor` / `ReactTo` handler does **not** run inside the trace of the event it handles. Downstream state/reaction stages run in the board's sharing coroutines and report `trace = null`. A `Provider` runs in the provider manager's (deduplicated) coroutine, not in the requester's trace. To link such work manually, capture the trace at the emission site (e.g. in an upstream interceptor via `currentTraceContext()`) and re-enter it with `withContext(trace.child("Handler"))`.
 
 **TraceContext fields:**
 
-| Field           | Type      | Default                       | Purpose                          |
-|-----------------|-----------|-------------------------------|----------------------------------|
-| `traceId`       | `String`  | `UUID.randomUUID().toString()`| Unique identifier for this trace |
-| `parentTraceId` | `String?` | `null`                        | Link to a parent trace           |
-| `emitterTag`    | `String?` | `null`                        | Human-readable emitter label     |
-| `timestamp`     | `Long`    | `System.nanoTime()`           | Monotonic creation timestamp     |
+| Field           | Type      | Default                       | Purpose                                              |
+|-----------------|-----------|-------------------------------|------------------------------------------------------|
+| `traceId`       | `String`  | `TraceContext.nextTraceId()` (`"trace-<n>"`, process-unique, monotonic) | Unique identifier for this trace point |
+| `parentTraceId` | `String?` | `null`                        | `traceId` of the trace active when this one was created |
+| `emitterTag`    | `String?` | `null`                        | Human-readable emitter label                         |
+| `timestamp`     | `Long`    | `System.nanoTime()`           | Monotonic creation timestamp                         |
+
+`trace.child(tag)` creates a trace point linked to `trace`; `TraceContext.childOf(parent, tag)` does the same for a nullable parent (a root trace when `null`).
 
 ---
 
@@ -1147,15 +1302,15 @@ flowchart TB
     subgraph Compose ["Compose UI Layer"]
         CC["CreateContext‹T›"] --> CS["ContextScope‹T›"]
         CS --> N["Node‹C, S›"]
-        N --> NS["NodeScope‹C, S›<br/>• update / Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept"]
+        N --> NS["NodeScope‹C, S›<br/>• update / Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept / addInterceptor"]
     end
 
     subgraph NonCompose ["Non-Compose Layer"]
-        CO["Coordinator()"] --> COS["CoordinatorScope<br/>• flow + handler overloads<br/>• Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept / dispose()"]
+        CO["Coordinator(owner | scope)"] --> COS["CoordinatorScope<br/>• flow + handler overloads<br/>• Broadcast / Trigger<br/>• ListenFor / ReactTo / Request<br/>• Intercept / onDispose / dispose()"]
     end
 
     subgraph SB ["SwitchBoard"]
-        BUS["broadcastState / triggerImpulse / handleRequest<br/>stateFlow / impulseFlow / addInterceptor"]
+        BUS["broadcastState / triggerImpulse / handleRequest<br/>stateFlow / impulseFlow / addInterceptor<br/>addObserver / close()"]
     end
 
     NS -->|"upstream"| BUS
@@ -1243,31 +1398,32 @@ sequenceDiagram
 
 ### Request Channel Detail (Provider Lifecycle)
 
-Zooms into the Request channel to show dedup, concurrency gating, and the `DataState` lifecycle.
+Zooms into the Request channel to show dedup, concurrency gating, idle teardown, and the `DataState` lifecycle.
 
 ```mermaid
 flowchart TD
     IMP["DataImpulse‹Need›<br/>(data class — structural equality)"]
     IMP --> UP_REQ["REQUEST × UPSTREAM<br/>Interceptors"]
-    UP_REQ --> DEDUP{"ActiveJob exists<br/>for this impulse?<br/>(equals/hashCode)"}
+    UP_REQ --> DEDUP{"Live ActiveJob<br/>for this impulse?<br/>(equals/hashCode)"}
 
-    DEDUP -->|"YES (dedup hit)"| EXISTING["Return existing<br/>SharedFlow‹DataState‹Need››"]
+    DEDUP -->|"YES (dedup hit)"| EXISTING["Ref-counted view of the<br/>existing SharedFlow‹DataState›"]
 
-    DEDUP -->|"NO"| CONC{"maxConcurrentJobs<br/>reached?"}
-    CONC -->|"YES"| ERR["Emit DataState.Error<br/>(ProviderConcurrencyException)"]
+    DEDUP -->|"NO"| RESOLVE["ProviderRegistry.resolve(impulseType)<br/>→ RegisteredFactory"]
+    RESOLVE -->|"not found"| THROW["NoProviderException<br/>(→ DataState.Error)"]
 
-    CONC -->|"NO"| RESOLVE["ProviderRegistry.resolve(impulseType)<br/>→ RegisteredFactory"]
-    RESOLVE -->|"not found"| THROW["throw NoProviderException"]
+    RESOLVE -->|"found"| CONC{"Atomic insert:<br/>live-job permit available?<br/>(maxConcurrentJobs)"}
+    CONC -->|"NO"| ERR["Emit DataState.Error<br/>(ProviderConcurrencyException)"]
 
-    RESOLVE -->|"found"| CREATE["Create ActiveJob‹Need›<br/>• MutableSharedFlow(replay=1, buffer=64)<br/>• SupervisorJob (isolated)"]
-    CREATE --> WAIT["Suspend until first subscriber"]
-    WAIT --> SCOPE["Create ProviderScope(switchboard, scope)"]
-    SCOPE --> LOADING["Emit DataState.Loading"]
-    LOADING --> PRODUCE["factory.produceErased(impulse, providerScope)<br/>→ Flow‹Need›"]
-    PRODUCE --> COLLECT["Collect emissions:<br/>Class.cast → update lastSuccess → DataState.Success"]
+    CONC -->|"YES"| CREATE["Create ActiveJob (LAZY)<br/>• MutableSharedFlow(replay=1, buffer=64)<br/>• child of the board's SupervisorJob"]
+    CREATE --> WAIT["Wait for first collector<br/>(idle timer running)"]
+    WAIT -->|"no collector within<br/>providerIdleTimeout"| IDLE["Cancel job, evict entry"]
+    WAIT --> LOADING["Emit DataState.Loading"]
+    LOADING --> PRODUCE["ProviderScope + factory.create().produce(impulse)<br/>→ Flow‹Need›"]
+    PRODUCE --> COLLECT["Collect emissions:<br/>cast to registered Need → DataState.Success"]
     COLLECT --> COMPLETE["Flow completes"]
-    PRODUCE -->|"exception"| ERROR["DataState.Error(cause, lastSuccess.value)"]
-    COMPLETE --> CLEANUP["Remove from activeJobs (finally)"]
+    COLLECT -->|"last collector left for<br/>providerIdleTimeout"| IDLE
+    PRODUCE -->|"exception"| ERROR["DataState.Error(cause, lastSuccess)"]
+    COMPLETE --> CLEANUP["Remove from activeJobs<br/>(only if still mapped to this job)"]
     ERROR --> CLEANUP
 
     EXISTING --> DN_REQ["REQUEST × DOWNSTREAM<br/>Interceptors"]
@@ -1303,7 +1459,7 @@ Each interceptor receives the data and a `Chain` handle. It can:
 - **Transform**: `chain.proceed(modifiedData)` — mutation before next
 - **Short-circuit**: return a value without calling `proceed` — skip remaining interceptors
 
-Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result.
+Type resolution: The registry finds all entries whose registered `KClass` is a supertype of the target type (via `Class.isAssignableFrom`), merges and sorts them by priority, and caches the result together with a pre-built, immutable chain — a steady-state call is one map lookup and allocates no chain objects. A call sees the interceptor set as of its start; registrations made during it apply to later calls.
 
 ---
 
@@ -1480,14 +1636,14 @@ Uber's architecture. A tree of Routers (navigation), Interactors (business logic
 | Dimension | RIBs | Synapse |
 |-----------|------|---------|
 | **Topology** | Tree — parent RIBs attach/detach children, data flows through the tree | Flat — all components communicate through the SwitchBoard, no parent-child hierarchy |
-| **Scoping** | Explicit — each RIB has its own DI scope; child lifecycle is tied to parent | Implicit — Node lifecycle is tied to Compose; Coordinator lifecycle is tied to LifecycleOwner |
+| **Scoping** | Explicit — each RIB has its own DI scope; child lifecycle is tied to parent | Implicit — Node lifecycle is tied to Compose; Coordinator lifecycle is tied to a LifecycleOwner or a CoroutineScope |
 | **Communication** | Listener interfaces between parent and child (typed but coupled to tree structure) | Impulses through the bus (typed but decoupled from any structure) |
 | **Navigation** | Router-driven — Routers attach/detach child RIBs | Impulse-driven — `Trigger(NavigateTo(...))`, consumed by a navigation coordinator |
 | **Compose support** | Retrofit — RIBs predates Compose, integration exists but isn't native | Native — `CreateContext`/`Node` are Compose-first |
 | **Boilerplate** | Very high — Router + Interactor + Builder + (View) per feature | Low — `Node` or `Coordinator` per feature, no ceremony |
 | **Team scalability** | Excellent — strict boundaries prevent teams from coupling to each other's code | Excellent — zero coupling between components, impulse types are the only shared contract |
 | **Structural enforcement** | Architecture is enforced by the tree — a RIB can only talk to its parent and children, making illegal communication physically impossible | Convention-based — any component can `Trigger` any impulse type; discipline and namespacing replace structural enforcement |
-| **Lifecycle scoping** | Hierarchical — child RIB lifecycle is strictly bounded by parent; cleanup is automatic and deterministic | Flat — Node is tied to composition, Coordinator to LifecycleOwner; no built-in parent-child scope nesting |
+| **Lifecycle scoping** | Hierarchical — child RIB lifecycle is strictly bounded by parent; cleanup is automatic and deterministic | Mostly flat — Node is tied to composition, Coordinator to a LifecycleOwner or CoroutineScope; a scope-bound Coordinator can nest under another Coordinator, but there is no enforced hierarchy |
 | **Production track record** | Proven at Uber scale (hundreds of engineers, years of production use) | Early — production-validated at smaller scale |
 
 **RIBs' strength**: battle-tested at Uber scale with hundreds of engineers. The tree structure provides clear ownership and scoping that prevents the kind of spaghetti that flat architectures risk. If you have 50+ engineers and need enforced structural boundaries, RIBs provides that.
