@@ -28,9 +28,13 @@ class TypedSharedFlow<T : Any>(
 ) : SharedFlow<T> {
 
     override val replayCache: List<T>
-        get() = source.replayCache.map { clazz.checkedCast(it) }
+        get() = source.replayCache.map { clazz.checkedCast(it, CONTEXT) }
 
     override suspend fun collect(collector: FlowCollector<T>): Nothing {
-        source.collect { collector.emit(clazz.checkedCast(it)) }
+        source.collect { collector.emit(clazz.checkedCast(it, CONTEXT)) }
+    }
+
+    private companion object {
+        const val CONTEXT = "TypedSharedFlow element"
     }
 }

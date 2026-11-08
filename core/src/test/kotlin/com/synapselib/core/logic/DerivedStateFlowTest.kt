@@ -286,4 +286,38 @@ class LogicExtensionsTest {
 
         job.cancel()
     }
+
+    @Test
+    fun `(regression) derived flow never emits equal consecutive values`() = runTest {
+        val a = MutableStateFlow(false)
+        val b = MutableStateFlow(false)
+        val result = a and b
+        val seen = mutableListOf<Boolean>()
+
+        val job = launch { result.collect { seen.add(it) } }
+        advanceUntilIdle()
+
+        // b toggles but (false && b) stays false: a real StateFlow would not re-emit.
+        b.value = true
+        advanceUntilIdle()
+        b.value = false
+        advanceUntilIdle()
+        a.value = true
+        b.value = true
+        advanceUntilIdle()
+
+        assertEquals(listOf(false, true), seen)
+        job.cancel()
+    }
+
+    @Test
+    fun `NOT is usable as the prefix operator`() = runTest {
+        val a = MutableStateFlow(true)
+        val negated: StateFlow<Boolean> = !a
+
+        assertFlowValue(false, negated)
+        a.value = false
+        assertFlowValue(true, negated)
+        assertTrue(negated.first())
+    }
 }
