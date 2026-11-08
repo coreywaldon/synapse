@@ -3,6 +3,7 @@ package com.synapselib.arch.base
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.RememberObserver
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -278,9 +279,10 @@ inline fun <reified S : Any> rememberState(
  * added via [addInterceptor]; afterwards [addInterceptor] unregisters new
  * registrations immediately (see [isDisposed]).
  *
- * Long-lived listeners ([ListenFor], [ReactTo], [Request]) and composable
- * interceptors ([Intercept]) are managed via [DisposableEffect] and canceled
- * automatically when their keys change or the composable is removed.
+ * Long-lived listeners ([ListenFor], [ReactTo], [Request]) are managed via
+ * [DisposableEffect]; composable interceptors ([Intercept]) are registered
+ * synchronously during composition and held by a remembered observer. Both are
+ * released automatically when their keys change or the composable is removed.
  *
  * @param C the context type from the enclosing [ContextScope].
  * @param S the local state type.
@@ -307,9 +309,18 @@ class NodeScope<C, S : Any>(
 
     /**
      * Interceptor registrations made via [addInterceptor] that will be
-     * [unregistered][Registration.unregister] on [dispose]. Synchronized list.
+     * [unregistered][Registration.unregister] on [dispose].
+     *
+     * **ABI-only.** This is `@PublishedApi` because the 1.0.x inline
+     * `Intercept` body — already compiled into consumers' bytecode — calls
+     * `getRegistrations().add(registration)`. The returned list is a view
+     * whose `add` routes through the thread-safe tracker (so an `add` after
+     * [dispose] unregisters the registration immediately instead of leaking
+     * it); reads reflect the live tracked registrations. Do not use it from
+     * new code — call [addInterceptor] instead.
      */
-    internal val registrations: MutableList<Registration> get() = tracker.registrations
+    @PublishedApi
+    internal val registrations: MutableList<Registration> get() = tracker.mutableView()
 
     /** `true` once [dispose] has run. */
     val isDisposed: Boolean get() = tracker.isDisposed
@@ -359,7 +370,13 @@ class NodeScope<C, S : Any>(
      *
      * The interceptor is registered **once** per distinct ([point],
      * [priority], [key]) and unregistered when the call leaves the composition
-     * or one of those values changes. Recompositions do not re-register; the
+     * or one of those values changes. Registration happens **synchronously
+     * during composition** (as in 1.0.x), so it is already active when any
+     * effect of the same composition runs — a [Request], [ListenFor] or
+     * [ReactTo] declared *before* the `Intercept` call still sees the
+     * interceptor from its very first emission. If the composition is
+     * abandoned (it throws before being applied), the registration is released.
+     * Recompositions do not re-register; the
      * most recent [interceptor] instance passed in is always the one invoked
      * (it is held via [rememberUpdatedState]), so capturing fresh state in
      * the lambda is safe:
@@ -393,7 +410,20 @@ class NodeScope<C, S : Any>(
         InterceptEffect(T::class, point, interceptor, priority, key)
     }
 
-    /** Non-reified body of [Intercept]. */
+    /**
+     * Non-reified body of [Intercept].
+     *
+     * Registers inside a keyed `remember` so the interceptor is live as soon as
+     * this call is composed (before any effect of the composition runs). The
+     * remembered [ComposedInterceptorRegistration] is a [RememberObserver]:
+     * it unregisters when forgotten (left the composition or a key changed)
+     * and when abandoned (the composition failed before being applied), so no
+     * registration can outlive its call site.
+     *
+     * When a key changes, the replacement is registered during recomposition
+     * and the previous one is removed when that recomposition is applied, so
+     * for that brief window both may be installed.
+     */
     @PublishedApi
     @Composable
     internal fun <T : Any> InterceptEffect(
@@ -404,15 +434,42 @@ class NodeScope<C, S : Any>(
         key: Any?,
     ) {
         val current = rememberUpdatedState(interceptor)
-        DisposableEffect(this, point, clazz, priority, key) {
-            val registration = switchboard.addInterceptor(
-                point,
-                clazz,
-                Interceptor { data, chain -> current.value.intercept(data, chain) },
-                priority,
+        remember(this, point, clazz, priority, key) {
+            ComposedInterceptorRegistration(
+                switchboard.addInterceptor(
+                    point,
+                    clazz,
+                    Interceptor { data, chain -> current.value.intercept(data, chain) },
+                    priority,
+                ),
             )
-            onDispose { registration.unregister() }
         }
+    }
+
+    /**
+     * **Binary-compatibility shim — not callable from source.**
+     *
+     * The 1.0.x non-composable `Intercept(point, interceptor, priority)`. It
+     * is kept (hidden) only so its JVM signature still exists for code
+     * compiled against 1.0.x; such code inlined the old body, which goes
+     * through the ABI-only [registrations] view and is therefore still cleaned
+     * up on [dispose]. Hidden rather than visible so that `Intercept(...)` in a
+     * composable body always resolves to the composable overload (the old one
+     * re-registered on every recomposition). Use the composable [Intercept] or
+     * [addInterceptor].
+     */
+    @Deprecated(
+        "Binary-compatibility shim for code compiled against 1.0.x. Use the composable " +
+            "Intercept(point, interceptor, priority, key) or addInterceptor(point, interceptor, priority).",
+        level = DeprecationLevel.HIDDEN,
+    )
+    @Suppress("FunctionName")
+    inline fun <reified T : Any> Intercept(
+        point: InterceptPoint,
+        interceptor: Interceptor<T>,
+        priority: Int = 0,
+    ) {
+        addInterceptor(point, interceptor, priority)
     }
 
     /**
@@ -562,5 +619,27 @@ class NodeScope<C, S : Any>(
             }
             onDispose { job.cancel() }
         }
+    }
+}
+
+// ── Composable interceptor registration ─────────────────────────────────
+
+/**
+ * Holds a [Registration] made during composition by [NodeScope.Intercept] and
+ * releases it when the remembered slot is forgotten or abandoned. Release is
+ * idempotent.
+ */
+private class ComposedInterceptorRegistration(registration: Registration) : RememberObserver {
+
+    private val registration = java.util.concurrent.atomic.AtomicReference<Registration?>(registration)
+
+    override fun onRemembered() = Unit
+
+    override fun onForgotten() = release()
+
+    override fun onAbandoned() = release()
+
+    private fun release() {
+        registration.getAndSet(null)?.unregister()
     }
 }

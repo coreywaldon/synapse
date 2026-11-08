@@ -285,14 +285,29 @@ class CoordinatorScope private constructor(
 
     /**
      * Interceptor registrations made via [Intercept] that will be
-     * [unregistered][Registration.unregister] on [dispose]. Synchronized list.
+     * [unregistered][Registration.unregister] on [dispose].
+     *
+     * **ABI-only.** `@PublishedApi` because the 1.0.x inline [Intercept] body —
+     * already compiled into consumers' bytecode — calls
+     * `getRegistrations().add(registration)`. The returned list is a view
+     * whose `add` routes through the thread-safe tracker, so an `add` after
+     * [dispose] unregisters the registration immediately instead of leaking
+     * it; reads reflect the live tracked registrations. New code never needs
+     * it: [Intercept] tracks registrations itself.
      */
-    internal val registrations: MutableList<Registration> get() = tracker.registrations
+    @PublishedApi
+    internal val registrations: MutableList<Registration> get() = tracker.mutableView()
 
     /**
      * Snapshot of the registered lifecycle-event callbacks, keyed by event.
      * Empty for a lifecycle-free coordinator and after [dispose].
+     *
+     * **ABI-only** `@PublishedApi` (it was `@PublishedApi` in 1.0.x, so its
+     * JVM getter `getLifecycleRegistrations()` is kept). The map and lists are
+     * copies — mutating them does not register or remove hooks; use the
+     * `onX { }` methods instead.
      */
+    @PublishedApi
     internal val lifecycleRegistrations: Map<Lifecycle.Event, List<() -> Unit>>
         get() = synchronized(lock) {
             lifecycleBinding?.callbacks?.mapValues { it.value.toList() } ?: emptyMap()
@@ -460,8 +475,13 @@ class CoordinatorScope private constructor(
      * dispatches [event]. Multiple callbacks for the same event are executed
      * in the order they were registered. See the class docs for replay rules.
      *
+     * `@PublishedApi` only to keep the 1.0.x JVM signature
+     * `addLifecycleEventRegistration(Lifecycle.Event, Function0)`; prefer the
+     * `onX { }` wrappers.
+     *
      * @throws IllegalStateException on a lifecycle-free coordinator.
      */
+    @PublishedApi
     internal fun addLifecycleEventRegistration(event: Lifecycle.Event, callback: () -> Unit) {
         require(event != Lifecycle.Event.ON_ANY) { "ON_ANY is not supported" }
         val binding = checkNotNull(lifecycleBinding) {

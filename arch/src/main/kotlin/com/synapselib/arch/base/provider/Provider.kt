@@ -123,8 +123,12 @@ abstract class Provider<I : DataImpulse<Need>, Need : Any> {
  * @param coroutineScope the backing scope; canceled when the provider is disposed.
  * @param tag            optional emitter label for [com.synapselib.arch.base.TraceContext].
  *                       `null` (the default) disables tracing for this scope.
+ *
+ * The constructor is [JvmOverloads] so the 1.0.x two-argument JVM constructor
+ * `ProviderScope(SwitchBoard, CoroutineScope)` still exists for code compiled
+ * against 1.0.x (and for Java callers).
  */
-class ProviderScope(
+class ProviderScope @JvmOverloads constructor(
     override val switchboard: SwitchBoard,
     coroutineScope: CoroutineScope,
     override val tag: String? = null,
