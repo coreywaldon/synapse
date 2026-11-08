@@ -310,7 +310,17 @@ Hidden (`DeprecationLevel.HIDDEN`) bridges keep the original JVM signatures of t
   handler.
 - A `CancellationException` thrown by a provider (e.g. from `withTimeout`) left collectors stuck
   in `Loading`.
-- `ProviderManager.dispose()` left in-flight collectors hanging.
+- Collectors already running when `ProviderManager.dispose()` was called (or its parent scope was
+  cancelled) hung forever; they now fail with `IllegalStateException`, as new collectors already
+  did. Through `DefaultSwitchBoard.handleRequest`, a collection running when the board is closed
+  completes normally instead; calling or collecting `handleRequest` after `close()` still throws.
+- A zero provider idle timeout (`stopTimeout = Duration.ZERO`, `SynapseTestRule(stateTimeout = 0)`,
+  or `ProviderManager(…, idleTimeoutMillis = 0)`) caused a `StackOverflowError` on an unconfined
+  worker. A job is now torn down as soon as its last collector leaves, never before its first
+  collector arrives.
+- Binary compatibility of the 1.0 `ProviderManager(ProviderRegistry, CoroutineScope,
+  CoroutineContext, Int)` constructor (and its default-arguments variant) is restored; pass
+  `idleTimeoutMillis` by name to choose a timeout.
 - Once the parent scope was cancelled, requests silently returned flows that never ran.
 - Calling `Registration.unregister()` twice on an interceptor needlessly invalidated the
   interceptor caches again.
