@@ -1197,11 +1197,14 @@ class DefaultSwitchBoardTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Full interceptor (short-circuit)
+    // Full interceptor (short-circuit = block)
     // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    fun `full interceptor can short-circuit state upstream`() = runTest(UnconfinedTestDispatcher()) {
+    fun `full interceptor that skips proceed blocks state upstream`() = runTest(UnconfinedTestDispatcher()) {
+        // Since 1.1.0 the end of the chain is the dispatch: an interceptor that
+        // does not call proceed blocks the value, and what it returns is
+        // discarded (before 1.1.0, UserState("blocked", -1) was emitted).
         val testDispatcher = UnconfinedTestDispatcher()
         val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
         val board = emptyBoard(boardScope)
@@ -1221,7 +1224,8 @@ class DefaultSwitchBoardTest {
         board.broadcastState(UserState::class, UserState("original"))
         advanceUntilIdle()
 
-        assertEquals(UserState("blocked", -1), received.first())
+        assertTrue(received.isEmpty(), "blocked state must not be emitted, got $received")
+        assertTrue(board.getRawStateFlow(UserState::class).replayCache.isEmpty())
 
         job.cancel()
     }
@@ -1331,14 +1335,16 @@ class DefaultSwitchBoardTest {
 
     @Test
     fun `full interceptor can replace value ignoring original for reactions`() = runTest(UnconfinedTestDispatcher()) {
+        // Since 1.1.0 a replacement must be passed on with proceed(substitute);
+        // returning it without proceeding would block the reaction instead.
         val testDispatcher = UnconfinedTestDispatcher()
         val boardScope = CoroutineScope(testDispatcher + SupervisorJob())
         val board = emptyBoard(boardScope)
         board.addInterceptor(
             point = InterceptPoint(Channel.REACTION, Direction.UPSTREAM),
             clazz = ToastReaction::class,
-            interceptor = Interceptor.full { _, _ ->
-                ToastReaction("replaced")
+            interceptor = Interceptor.full { _, proceed ->
+                proceed(ToastReaction("replaced"))
             },
         )
 

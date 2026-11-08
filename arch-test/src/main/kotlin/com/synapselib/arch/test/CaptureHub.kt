@@ -20,6 +20,13 @@ import kotlin.reflect.KClass
  * the rule interceptors use, so a capture sees what an interceptor registered
  * for `T` at `P` would see.
  *
+ * ### Blocked values
+ *
+ * A value an interceptor **blocked** (returned without calling `proceed`) was
+ * not dispatched, so it is never recorded by an ordinary sink. Sinks added
+ * with [addBlocked] record exactly those values instead (as they entered the
+ * blocking stage), via [SwitchBoardObserver.onBlocked].
+ *
  * ### Why an observer, not an interceptor
  *
  * Observers run after **all** interceptors of a stage, so captures always see
@@ -38,22 +45,40 @@ internal class CaptureHub : SwitchBoardObserver {
         val record: (Any) -> Unit,
     )
 
+    /** Sinks for dispatched values ([onData]). */
     private val sinks = CopyOnWriteArrayList<Sink>()
 
-    /** Adds a sink receiving every value of [type] (or a subtype) observed at [point]. */
+    /** Sinks for blocked values ([onBlocked]). */
+    private val blockedSinks = CopyOnWriteArrayList<Sink>()
+
+    /** Adds a sink receiving every value of [type] (or a subtype) dispatched at [point]. */
     fun add(point: InterceptPoint, type: KClass<*>, record: (Any) -> Unit) {
         sinks += Sink(point, type.javaObjectType, record)
+    }
+
+    /** Adds a sink receiving every value of [type] (or a subtype) an interceptor blocked at [point]. */
+    fun addBlocked(point: InterceptPoint, type: KClass<*>, record: (Any) -> Unit) {
+        blockedSinks += Sink(point, type.javaObjectType, record)
     }
 
     /** Removes every sink. Already captured values are kept by their captures. */
     fun clear() {
         sinks.clear()
+        blockedSinks.clear()
     }
 
     override fun onData(point: InterceptPoint, clazz: KClass<*>, data: Any, trace: TraceContext?) {
-        if (sinks.isEmpty()) return
+        dispatch(sinks, point, clazz, data)
+    }
+
+    override fun onBlocked(point: InterceptPoint, clazz: KClass<*>, data: Any, trace: TraceContext?) {
+        dispatch(blockedSinks, point, clazz, data)
+    }
+
+    private fun dispatch(targets: List<Sink>, point: InterceptPoint, clazz: KClass<*>, data: Any) {
+        if (targets.isEmpty()) return
         val token = clazz.javaObjectType
-        for (sink in sinks) {
+        for (sink in targets) {
             if (sink.point == point && sink.type.isAssignableFrom(token)) sink.record(data)
         }
     }

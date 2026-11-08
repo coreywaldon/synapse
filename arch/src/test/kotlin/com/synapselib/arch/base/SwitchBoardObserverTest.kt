@@ -320,6 +320,136 @@ class SwitchBoardObserverTest {
         callerJob.cancel()
     }
 
+    // ── Blocked values ──────────────────────────────────────────────────
+
+    /** Records [onData] and [onBlocked] separately. */
+    private class RecordingObserver : SwitchBoardObserver {
+        val data = CopyOnWriteArrayList<Seen>()
+        val blocked = CopyOnWriteArrayList<Seen>()
+        override fun onData(point: InterceptPoint, clazz: KClass<*>, data: Any, trace: TraceContext?) {
+            this.data += Seen(point, clazz, data, trace)
+        }
+        override fun onBlocked(point: InterceptPoint, clazz: KClass<*>, data: Any, trace: TraceContext?) {
+            blocked += Seen(point, clazz, data, trace)
+        }
+    }
+
+    @Test
+    fun `blocked upstream values are reported via onBlocked, not onData`() = runTest(UnconfinedTestDispatcher()) {
+        val board = newBoard()
+        board.addInterceptor(InterceptPoint.STATE_UPSTREAM, Interceptor.full<UserState> { s, proceed ->
+            if (s.name == "ok") proceed(s.copy(name = "OK")) else s.copy(name = "substitute")
+        })
+        board.addInterceptor(InterceptPoint.REACTION_UPSTREAM, Interceptor<Toast> { t, _ -> t })
+        val observer = RecordingObserver()
+        board.addObserver(observer)
+
+        board.broadcastState(UserState::class, UserState("ok"))
+        board.broadcastState(UserState::class, UserState("nope"))
+        withContext(TraceContext(emitterTag = "Emitter")) { board.triggerImpulse(Toast::class, Toast("t")) }
+
+        assertEquals(listOf(Seen(InterceptPoint.STATE_UPSTREAM, UserState::class, UserState("OK"), null)), observer.data)
+        assertEquals(2, observer.blocked.size)
+        // onBlocked receives the value as it entered the stage, not the discarded return value.
+        assertEquals(Seen(InterceptPoint.STATE_UPSTREAM, UserState::class, UserState("nope"), null), observer.blocked[0])
+        val reaction = observer.blocked[1]
+        assertEquals(InterceptPoint.REACTION_UPSTREAM, reaction.point)
+        assertEquals(Toast::class, reaction.clazz)
+        assertEquals(Toast("t"), reaction.data)
+        assertEquals("Emitter", reaction.trace?.emitterTag)
+        board.close()
+    }
+
+    @Test
+    fun `blocked downstream values are reported via onBlocked, not onData`() = runTest(UnconfinedTestDispatcher()) {
+        val board = newBoard()
+        board.addInterceptor(InterceptPoint.STATE_DOWNSTREAM, Interceptor.full<UserState> { s, proceed ->
+            if (s.name != "hidden") proceed(s) else s
+        })
+        val observer = RecordingObserver()
+        board.addObserver(observer)
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) { board.stateFlow(UserState::class).collect { } }
+
+        board.broadcastState(UserState::class, UserState("shown"))
+        board.broadcastState(UserState::class, UserState("hidden"))
+        advanceUntilIdle()
+
+        val downstreamData = observer.data.filter { it.point == InterceptPoint.STATE_DOWNSTREAM }.map { it.data }
+        assertEquals(listOf<Any>(UserState("shown")), downstreamData)
+        assertEquals(listOf(Seen(InterceptPoint.STATE_DOWNSTREAM, UserState::class, UserState("hidden"), null)), observer.blocked)
+        // Upstream was not blocked, so both values were reported there.
+        assertEquals(2, observer.data.count { it.point == InterceptPoint.STATE_UPSTREAM })
+        job.cancel()
+        board.close()
+    }
+
+    @Test
+    fun `blocked request upstream and downstream values are reported via onBlocked`() = runTest(UnconfinedTestDispatcher()) {
+        val board = newBoard()
+        val observer = RecordingObserver()
+        board.addObserver(observer)
+        board.addInterceptor(InterceptPoint.REQUEST_UPSTREAM, Interceptor.full<Ask> { a, proceed ->
+            if (a.q != "forbidden") proceed(a) else a
+        })
+        board.addInterceptor(InterceptPoint.REQUEST_DOWNSTREAM, Interceptor<Answer> { a, _ -> a })
+
+        val blockedJob = launch(UnconfinedTestDispatcher(testScheduler)) {
+            board.handleRequest(Ask::class, Answer::class, Ask("forbidden")).collect { }
+        }
+        val results = CopyOnWriteArrayList<DataState<Answer>>()
+        val allowedJob = launch(UnconfinedTestDispatcher(testScheduler)) {
+            board.handleRequest(Ask::class, Answer::class, Ask("fine")).collect { results += it }
+        }
+        advanceUntilIdle()
+
+        assertEquals(listOf<DataState<Answer>>(DataState.Loading), results, "the result was filtered downstream")
+        assertEquals(
+            listOf(
+                Seen(InterceptPoint.REQUEST_UPSTREAM, Ask::class, Ask("forbidden"), null),
+                Seen(InterceptPoint.REQUEST_DOWNSTREAM, Answer::class, Answer("re:fine"), null),
+            ),
+            observer.blocked,
+        )
+        assertEquals(listOf(Seen(InterceptPoint.REQUEST_UPSTREAM, Ask::class, Ask("fine"), null)), observer.data)
+        blockedJob.cancel()
+        allowedJob.cancel()
+        board.close()
+    }
+
+    @Test
+    fun `legacy logger and trace listener do not see blocked values`() = runTest(UnconfinedTestDispatcher()) {
+        val board = newBoard()
+        board.addInterceptor(InterceptPoint.REACTION_UPSTREAM, Interceptor.full<Toast> { t, proceed ->
+            if (t.message == "pass") proceed(t) else t
+        })
+        val logged = CopyOnWriteArrayList<Any>()
+        val traced = CopyOnWriteArrayList<Any>()
+        board.setGlobalLogger { _, _, data -> logged += data }
+        board.setTraceListener { _, _, _, data -> traced += data }
+
+        withContext(TraceContext(emitterTag = "T")) {
+            board.triggerImpulse(Toast::class, Toast("pass"))
+            board.triggerImpulse(Toast::class, Toast("block"))
+        }
+
+        assertEquals(listOf<Any>(Toast("pass")), logged)
+        assertEquals(listOf<Any>(Toast("pass")), traced)
+        board.close()
+    }
+
+    @Test
+    fun `a plain lambda observer ignores blocked values`() = runTest(UnconfinedTestDispatcher()) {
+        val board = newBoard()
+        board.addInterceptor(InterceptPoint.STATE_UPSTREAM, Interceptor<UserState> { s, _ -> s })
+        val seen = CopyOnWriteArrayList<Any>()
+        board.addObserver { _, _, data, _ -> seen += data }
+
+        board.broadcastState(UserState::class, UserState("x"))
+
+        assertTrue(seen.isEmpty())
+        board.close()
+    }
+
     // ── Interface evolution ─────────────────────────────────────────────
 
     /** A third-party implementation written against the original interface. */

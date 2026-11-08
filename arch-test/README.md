@@ -281,6 +281,7 @@ Create captures **before** the action under test (they may even be created as fi
 | `onAllRequestResults<Need>()` | `CaptureAll<Need>` | `REQUEST / DOWNSTREAM` | every result delivered, in order |
 | `capture<T>(point)` | `Capture<T>` | any `InterceptPoint` | latest value at that point |
 | `captureAll<T>(point)` | `CaptureAll<T>` | any `InterceptPoint` | every value at that point |
+| `onBlocked<T>(point)` / `captureBlocked(point, type)` | `CaptureAll<T>` | any `InterceptPoint` | every value an interceptor **blocked** at that point, in order |
 
 ```kotlin
 val login = synapse.onImpulse<LoginRequested>()
@@ -301,12 +302,20 @@ assertEquals(testAddresses, addresses.latest)
 
 // Downstream (as delivered to listeners, after downstream interceptors)
 val delivered = synapse.captureAll<Counter>(InterceptPoint.STATE_DOWNSTREAM)
+
+// Gates and filters: values an interceptor did not pass on with proceed
+val gated = synapse.onBlocked<FetchProfile>(InterceptPoint.REQUEST_UPSTREAM)
+val sent = synapse.onRequest<FetchProfile>()
+// … request a profile while logged out …
+gated.assertCount(1)
+sent.assertNotCaptured() // never reached the provider
 ```
 
 Notes:
 
 - **Request captures** are recorded per *collection* of a request flow (before provider deduplication). Results are recorded for each `DataState.Success` and for the `staleData` of a `DataState.Error`; a request that fails without data records no result.
 - **Downstream state/reaction points** only carry values while something collects the corresponding flow (a coordinator's `ListenFor`, a composable, `synapse.ListenFor<T>().collect { }`).
+- **Blocked values** (an interceptor returned without calling `proceed`, so the value was not emitted, sent to a provider or delivered) are never recorded by the ordinary captures. `onBlocked<T>(point)` records them instead, as they entered the blocking stage.
 - **Type matching** follows interceptor rules: a capture for `T` sees values whose *type token* (the reified type at the `Broadcast` / `Trigger` / `Request` call site, or the result type) is `T` or a subtype. `onState<SessionState>()` sees `Broadcast(SessionState.LoggedOut)`, but `onState<SessionState.LoggedOut>()` does **not** see `Broadcast<SessionState>(SessionState.LoggedOut)` — exactly like a `ListenFor<SessionState.LoggedOut>` listener.
 
 ### `Capture<T>`

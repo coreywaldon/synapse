@@ -152,7 +152,9 @@ data class InterceptPoint(val channel: Channel, val direction: Direction) {
  *
  * Every channel supports **upstream** (producer-side) and **downstream**
  * (consumer-side) interceptors. Register them via [addInterceptor] with an
- * [InterceptPoint] that identifies the exact stage.
+ * [InterceptPoint] that identifies the exact stage. The end of each stage's
+ * interceptor chain is the dispatch: an interceptor that does not call
+ * `proceed` **blocks** the value at that stage (see [addInterceptor]).
  *
  * ## Observation
  *
@@ -182,8 +184,10 @@ interface SwitchBoard {
      * Emits a new [data] value into the state channel for type [clazz].
      *
      * Upstream interceptors (`STATE / UPSTREAM`) are applied before the value
-     * is emitted. Because state flows use `replay = 1`, the most recent value
-     * is always cached and immediately delivered to new collectors.
+     * is emitted; if one of them blocks it (does not call `proceed`), nothing
+     * is emitted and the state keeps its previous value. Because state flows
+     * use `replay = 1`, the most recent value is always cached and immediately
+     * delivered to new collectors.
      *
      * @param T     the state type.
      * @param clazz the [KClass] token identifying the state stream.
@@ -195,7 +199,8 @@ interface SwitchBoard {
      * Emits a fire-and-forget reaction into the reaction channel for type [clazz].
      *
      * Upstream interceptors (`REACTION / UPSTREAM`) are applied before the
-     * value is emitted. Reaction flows have **no replay**, so only active
+     * value is emitted; if one of them blocks it (does not call `proceed`),
+     * nothing is emitted. Reaction flows have **no replay**, so only active
      * collectors will receive the event.
      *
      * @param T     the reaction type.
@@ -212,6 +217,15 @@ interface SwitchBoard {
      * 2. The (possibly transformed) params are forwarded to the [com.synapselib.arch.base.provider.ProviderManager].
      * 3. **Downstream interceptors** (`REQUEST / DOWNSTREAM`) are applied to
      *    each `Success`/`Error` payload before it is emitted.
+     *
+     * If an upstream interceptor **blocks** the impulse (does not call
+     * `proceed`), no provider is started (nothing is deduplicated and no
+     * concurrency permit is taken): the flow emits [DataState.Loading] and then
+     * stays in `Loading` until the collector is cancelled (or, for
+     * [DefaultSwitchBoard], until the board is closed, when the collection
+     * completes normally). If a downstream interceptor blocks a
+     * `Success.data`, that `Success` is not emitted; if it blocks an
+     * `Error.staleData`, the `Error` is emitted with `staleData = null`.
      *
      * The returned flow is cold — each subscriber re-runs upstream interception
      * and subscribes to the provider pipeline. The provider itself deduplicates
@@ -240,7 +254,9 @@ interface SwitchBoard {
      * downstream interceptors (`STATE / DOWNSTREAM`) already applied.
      *
      * The flow has `replay = 1`, so new collectors immediately receive the
-     * latest intercepted value (if one has been broadcast).
+     * latest intercepted value (if one has been broadcast). A value blocked by
+     * a downstream interceptor is not delivered and does not replace the
+     * replayed value: listeners keep the last value that passed.
      *
      * @param T     the state type.
      * @param clazz the [KClass] token identifying the state stream.
@@ -253,6 +269,7 @@ interface SwitchBoard {
      * downstream interceptors (`REACTION / DOWNSTREAM`) already applied.
      *
      * The flow has `replay = 0` — only active collectors receive events.
+     * Events blocked by a downstream interceptor are not delivered.
      *
      * @param T     the reaction type.
      * @param clazz the [KClass] token identifying the reaction stream.
@@ -288,6 +305,37 @@ interface SwitchBoard {
     /**
      * Registers an [interceptor] at the specified [point] for data of type [clazz].
      *
+     * The interceptor also runs for every subtype of [clazz]. The end of the
+     * point's chain is the **dispatch**: the value the chain returns is
+     * emitted / routed / delivered only if a `proceed` call reached the end
+     * of the chain. An interceptor that returns without calling `proceed`
+     * **blocks** the value (the value it returned is discarded):
+     *
+     * | Point | Effect of blocking |
+     * |---|---|
+     * | `STATE / UPSTREAM` | Nothing is emitted; the state keeps its previous value. |
+     * | `REACTION / UPSTREAM` | Nothing is emitted. |
+     * | `REQUEST / UPSTREAM` | No provider runs; the request flow emits `Loading` and stalls there. |
+     * | `STATE / DOWNSTREAM` | Not delivered; listeners (and the replay) keep the previous value. |
+     * | `REACTION / DOWNSTREAM` | Not delivered. |
+     * | `REQUEST / DOWNSTREAM` | A blocked `Success` is not emitted; a blocked `Error.staleData` becomes `null`. |
+     *
+     * To replace a value instead, call `proceed(substitute)`.
+     *
+     * ```kotlin
+     * // Auth gate: requests only reach their provider with a valid session.
+     * switchBoard.addInterceptor<RequiresAuth>(
+     *     InterceptPoint.REQUEST_UPSTREAM,
+     *     Interceptor.full { impulse, proceed ->
+     *         if (session.isValid()) proceed(impulse)
+     *         else { switchBoard.triggerImpulse(NavigateToLogin); impulse } // blocked
+     *     },
+     * )
+     * ```
+     *
+     * Observers are told about blocked values through
+     * [SwitchBoardObserver.onBlocked], not [SwitchBoardObserver.onData].
+     *
      * @param T           the data type the interceptor operates on.
      * @param point       identifies the channel and direction to intercept.
      * @param clazz       the [KClass] token for [T].
@@ -307,8 +355,10 @@ interface SwitchBoard {
 
     /**
      * Registers a type-agnostic, read-only [observer] that is notified of every
-     * value at every [InterceptPoint] (after that point's interceptors ran),
-     * together with the active [TraceContext], if any.
+     * value dispatched at every [InterceptPoint] (after that point's
+     * interceptors ran), together with the active [TraceContext], if any.
+     * Values blocked by an interceptor are reported through
+     * [SwitchBoardObserver.onBlocked] instead.
      *
      * Any number of observers may be registered; they are invoked in
      * registration order. See [SwitchBoardObserver] for the full contract.
@@ -439,6 +489,14 @@ annotation class SwitchBoardWorkerContext
  *   and started with [SwitchBoardConfig.sharingStarted].
  * - **Interceptors**: one [InterceptorRegistry] per [InterceptPoint], allowing
  *   independent priority ordering for each stage.
+ *
+ * ## Blocked values
+ *
+ * Every stage asks its pipeline for the outcome via
+ * [InterceptorPipeline.applyInterceptorsOrNull]: a value whose interceptor
+ * chain did not reach its end is blocked — not emitted, routed or delivered —
+ * and reported to observers via [SwitchBoardObserver.onBlocked]. See
+ * [SwitchBoard.addInterceptor] for the effect at each point.
  *
  * ## Downstream failures
  *
@@ -575,10 +633,14 @@ class DefaultSwitchBoard(
 
     // ── Channels ────────────────────────────────────────────────────────
 
-    /** Downstream hook shared by both channel stores. */
+    /**
+     * Downstream hook shared by both channel stores. A value blocked by a
+     * downstream interceptor is dropped, exactly like a failed one, so it is
+     * neither delivered nor stored in the downstream flow's replay cache.
+     */
     private val downstreamStage = DownstreamStage { point, clazz, value ->
         try {
-            processAndLog(point, clazz, value)
+            processAndLog(point, clazz, value) ?: DownstreamStage.DROP
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -664,13 +726,15 @@ class DefaultSwitchBoard(
 
     override suspend fun <T : Any> broadcastState(clazz: KClass<T>, data: T) {
         checkOpen()
-        val processed = processAndLog(InterceptPoint.STATE_UPSTREAM, clazz, data)
+        // null: blocked by an upstream interceptor — nothing is emitted.
+        val processed = processAndLog(InterceptPoint.STATE_UPSTREAM, clazz, data) ?: return
         stateStore.lane(clazz).raw.emit(processed)
     }
 
     override suspend fun <T : Any> triggerImpulse(clazz: KClass<T>, data: T) {
         checkOpen()
-        val processed = processAndLog(InterceptPoint.REACTION_UPSTREAM, clazz, data)
+        // null: blocked by an upstream interceptor — nothing is emitted.
+        val processed = processAndLog(InterceptPoint.REACTION_UPSTREAM, clazz, data) ?: return
         reactionStore.lane(clazz).raw.emit(processed)
     }
 
@@ -678,7 +742,11 @@ class DefaultSwitchBoard(
      * See [SwitchBoard.handleRequest].
      *
      * A collection that is already running when the board is closed (or its
-     * scope is cancelled) completes normally instead of hanging.
+     * scope is cancelled) completes normally instead of hanging. That includes
+     * a collection whose impulse was blocked by a `REQUEST / UPSTREAM`
+     * interceptor: it emits [DataState.Loading], then suspends — without
+     * launching any coroutine or touching the provider runtime — until its
+     * collector is cancelled or the board is closed.
      *
      * @throws IllegalStateException if the board is closed — both when called
      *         and when the returned flow is collected.
@@ -692,6 +760,17 @@ class DefaultSwitchBoard(
         return flow {
             checkOpen()
             val processedImpulse = processAndLog(InterceptPoint.REQUEST_UPSTREAM, impulseType, impulse)
+            if (processedImpulse == null) {
+                // Blocked upstream: the impulse never reaches the ProviderManager
+                // (no provider, no dedup entry, no concurrency permit). Report
+                // Loading and stall in it until the collector cancels; the wait
+                // is on the collector's own coroutine, so cancelling it leaves
+                // nothing behind. Closing the board ends it normally, like any
+                // other running request collection.
+                emit(DataState.Loading)
+                boardJob.join()
+                return@flow
+            }
 
             val providerFlow = try {
                 providerManager.request(
@@ -710,12 +789,15 @@ class DefaultSwitchBoard(
                     when (state) {
                         is DataState.Success<Need> -> {
                             val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state.data)
-                            emit(DataState.Success(interceptedData))
+                            // null: blocked downstream — this Success is filtered out.
+                            if (interceptedData != null) emit(DataState.Success(interceptedData))
                         }
 
                         is DataState.Error<Need> -> {
                             val staleData = state.staleData
                             if (staleData != null) {
+                                // null: blocked downstream — the error is still
+                                // reported, without the stale payload.
                                 val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, staleData)
                                 emit(DataState.Error(state.cause, interceptedData))
                             } else {
@@ -805,7 +887,8 @@ class DefaultSwitchBoard(
 
     /**
      * Sets a global logger that will be invoked for ALL data passing through the
-     * [SwitchBoard], regardless of type, channel, or direction.
+     * [SwitchBoard], regardless of type, channel, or direction. Values blocked
+     * by an interceptor are not passed through, so they are not logged.
      *
      * This is useful for debugging, analytics, or global monitoring without needing
      * to register type-specific interceptors.
@@ -838,7 +921,8 @@ class DefaultSwitchBoard(
      *
      * Unlike [setGlobalLogger], this listener receives the [TraceContext] metadata
      * (emitter tag, trace ID, timestamp) in addition to the intercept point, type,
-     * and data. It fires only when tracing is active.
+     * and data. It fires only when tracing is active, and not for values
+     * blocked by an interceptor.
      *
      * This is a single slot: setting a new listener replaces the previous one,
      * and `null` removes it. It runs after the global logger and before
@@ -912,7 +996,9 @@ class DefaultSwitchBoard(
     /**
      * Processes the provided data through the interceptor pipeline associated
      * with the given intercept point and class, then notifies the registered
-     * observers (if any).
+     * observers (if any): [SwitchBoardObserver.onData] with the processed
+     * value when it is dispatched, [SwitchBoardObserver.onBlocked] with the
+     * input value when an interceptor blocked it.
      *
      * When no observer is registered this is just the pipeline call: the
      * coroutine context is not even inspected for a [TraceContext].
@@ -920,15 +1006,22 @@ class DefaultSwitchBoard(
      * @param point The intercept point specifying where in the processing pipeline the data will be handled.
      * @param clazz The [KClass] of the data type being processed.
      * @param data The input data to process through the interceptors.
-     * @return The processed data after it has passed through the interceptor pipeline.
+     * @return The processed data to dispatch, or `null` if an interceptor
+     *         blocked it (the caller must then not dispatch anything).
      */
-    private suspend fun <T : Any> processAndLog(point: InterceptPoint, clazz: KClass<out T>, data: T): T {
-        val processed = pipelineFor(point).applyInterceptors(clazz, data)
+    private suspend fun <T : Any> processAndLog(point: InterceptPoint, clazz: KClass<out T>, data: T): T? {
+        val processed = pipelineFor(point).applyInterceptorsOrNull(clazz, data)
         val observers = observerSnapshot
         if (observers.isNotEmpty()) {
             val trace = currentCoroutineContext()[TraceContext]
-            for (observer in observers) {
-                observer.onData(point, clazz, processed, trace)
+            if (processed != null) {
+                for (observer in observers) {
+                    observer.onData(point, clazz, processed, trace)
+                }
+            } else {
+                for (observer in observers) {
+                    observer.onBlocked(point, clazz, data, trace)
+                }
             }
         }
         return processed
@@ -958,6 +1051,7 @@ class DefaultSwitchBoard(
 
     private object EmptyPipeline : InterceptorPipeline {
         override suspend fun <T : Any> applyInterceptors(clazz: KClass<out T>, data: T): T = data
+        override suspend fun <T : Any> applyInterceptorsOrNull(clazz: KClass<out T>, data: T): T = data
     }
 
     private companion object {

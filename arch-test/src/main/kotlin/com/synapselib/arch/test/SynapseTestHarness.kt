@@ -331,6 +331,35 @@ open class SynapseTestHarness(
     inline fun <reified T : Any> captureAll(point: InterceptPoint): CaptureAll<T> = captureAll(point, T::class)
 
     /**
+     * Collects **all** values of type [T] (or a subtype) that an interceptor
+     * **blocked** at [point], in order — i.e. values for which no `proceed`
+     * call reached the end of the chain, so they were not emitted, sent to a
+     * provider or delivered. Each value is recorded as it entered the stage.
+     *
+     * Blocked values are never recorded by [capture] / [captureAll] or the
+     * `on…` helpers, which only see dispatched values.
+     */
+    fun <T : Any> captureBlocked(point: InterceptPoint, type: KClass<T>): CaptureAll<T> {
+        val capture = CaptureAll(point, type, blocked = true)
+        captureHub.addBlocked(point, type, capture::record)
+        return capture
+    }
+
+    /**
+     * Reified form of [captureBlocked]: collects every [T] an interceptor
+     * blocked at [point].
+     *
+     * ```kotlin
+     * val gated = synapse.onBlocked<FetchProfile>(InterceptPoint.REQUEST_UPSTREAM)
+     * val sent = synapse.onRequest<FetchProfile>()
+     * // ... request a profile while logged out ...
+     * gated.assertCount(1)
+     * sent.assertNotCaptured() // never reached the provider
+     * ```
+     */
+    inline fun <reified T : Any> onBlocked(point: InterceptPoint): CaptureAll<T> = captureBlocked(point, T::class)
+
+    /**
      * Captures the most recent impulse of type [T] triggered on the
      * **reaction** channel (upstream, i.e. as emitted, after upstream
      * interceptors).
