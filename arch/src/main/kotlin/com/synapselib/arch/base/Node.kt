@@ -14,9 +14,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -33,8 +33,9 @@ import kotlin.reflect.KClass
  * data class NavigateTo(val route: String) : Impulse()
  * ```
  *
- * Impulses are emitted via [NodeScope.Trigger] or [CoordinatorScope.Trigger]
- * and consumed via [NodeScope.ReactTo] or [CoordinatorScope.ReactTo].
+ * Impulses are emitted via [SynapseScope.Trigger] (available on every DSL
+ * scope) and consumed via [NodeScope.ReactTo], [CoordinatorScope.ReactTo] or
+ * the flow-returning [SynapseScope.ReactTo].
  *
  * Unlike state (which replays the latest value), impulses have **no replay** —
  * only active listeners receive them.
@@ -71,8 +72,8 @@ open class Impulse
  * @param context the value made available to all child scopes via
  *                [ContextScope.context].
  * @param tag     optional human-readable label (e.g., `"CheckoutScreen"`)
- *                attached to a [TraceContext] on every [ContextScope.Trigger]
- *                and [ContextScope.Broadcast] call. When `null` (the default),
+ *                attached to a [TraceContext] on every `Trigger`, `Broadcast`
+ *                and `Request` made through the context or its nodes. When `null` (the default),
  *                no tracing overhead is incurred.
  * @param block   composable content that runs inside the [ContextScope].
  */
@@ -101,78 +102,37 @@ inline fun <T> CreateContext(
  * so that [Node] can access both the context and the switchboard without
  * threading them through parameters manually.
  *
+ * The SwitchBoard verbs ([Broadcast], [Trigger], and the flow-returning
+ * [ListenFor]`()`, [ReactTo]`()` and [Request]`(impulse)`) are inherited from
+ * [SynapseScope].
+ *
  * @param T                 the type of the context value.
  * @property context        the domain object shared across all [Node]s in this
  *                          context boundary (e.g., a ViewModel).
  * @property switchboard    the [SwitchBoard] used for all cross-node communication
  *                          (state broadcasts, reactions, requests, interception).
  * @property coroutineScope a [CoroutineScope] available for callers within a
- *                          [ContextScope].
+ *                          [ContextScope]. [CreateContext] always supplies a
+ *                          composition-bound scope (`rememberCoroutineScope()`),
+ *                          which is canceled when the context leaves the
+ *                          composition. **The default value is an unowned
+ *                          `CoroutineScope(SupervisorJob() + Dispatchers.Default)`
+ *                          that nothing ever cancels** — it exists only for
+ *                          convenience when constructing a `ContextScope`
+ *                          manually (e.g. in tests). Pass an owned scope
+ *                          whenever coroutines launched from it must not
+ *                          outlive the caller.
  * @property tag            optional emitter label for [TraceContext]. When non-null,
- *                          every [Trigger] and [Broadcast] call wraps execution in a
- *                          `withContext(TraceContext(emitterTag = tag))`.
+ *                          every [Trigger], [Broadcast] and [Request] runs inside a
+ *                          fresh `TraceContext(emitterTag = tag)` linked to any
+ *                          ambient trace.
  */
 class ContextScope<T>(
     val context: T,
-    val switchboard: SwitchBoard,
-    val coroutineScope: CoroutineScope = CoroutineScope(Dispatchers.Default),
-    val tag: String? = null,
-) {
-    /**
-     * Triggers a fire-and-forget [Impulse] on the [SwitchBoard]'s reaction channel.
-     *
-     * This is a **suspending, non-composable** function:
-     *
-     * ```kotlin
-     * Button(onClick = { scope.launch { Trigger(ShowToast("Saved!")) } }) {
-     *     Text("Save")
-     * }
-     * ```
-     *
-     * Upstream reaction interceptors are applied before emission.
-     *
-     * @param A     the [Impulse] subtype (inferred).
-     * @param event the impulse event to emit.
-     */
-    @Suppress("FunctionName")
-    suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        if (tag != null) {
-            withContext(TraceContext(emitterTag = tag)) {
-                switchboard.triggerImpulse(event)
-            }
-        } else {
-            switchboard.triggerImpulse(event)
-        }
-    }
-
-    /**
-     * Broadcasts [data] into the [SwitchBoard]'s state channel.
-     *
-     * This is a **suspending, non-composable** function. Call it from a
-     * coroutine (e.g., inside `LaunchedEffect` or `scope.launch`):
-     *
-     * ```kotlin
-     * LaunchedEffect(Unit) {
-     *     Broadcast(UserProfile(name = "Alice"))
-     * }
-     * ```
-     *
-     * Upstream state interceptors are applied before emission.
-     *
-     * @param O    the state type (inferred).
-     * @param data the value to broadcast.
-     */
-    @Suppress("FunctionName")
-    suspend inline fun <reified O : Any> Broadcast(data: O) {
-        if (tag != null) {
-            withContext(TraceContext(emitterTag = tag)) {
-                switchboard.broadcastState(data)
-            }
-        } else {
-            switchboard.broadcastState(data)
-        }
-    }
-}
+    override val switchboard: SwitchBoard,
+    val coroutineScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    override val tag: String? = null,
+) : SynapseScope()
 
 /**
  * Composable that creates a **stateful node** inside a [ContextScope].
@@ -184,7 +144,8 @@ class ContextScope<T>(
  *
  * The node's [NodeScope] is `remember`ed across recompositions and
  * automatically [disposed][NodeScope.dispose] when it leaves the composition,
- * which unregisters any interceptors added via [NodeScope.Intercept].
+ * which unregisters any interceptors added via [NodeScope.addInterceptor]
+ * ([NodeScope.Intercept] registrations are owned by their own effects).
  *
  * ### Usage
  *
@@ -300,21 +261,26 @@ inline fun <reified S : Any> rememberState(
  * | **Local state** | [update] | No — call from callbacks |
  * | **State broadcast** | [Broadcast] | No — suspending |
  * | **Reactions** | [Trigger] | No — suspending |
- * | **Interception** | [Intercept] | No — registers immediately |
- * | **Request** | [Request] | Yes — lifecycle-aware |
- * | **Listen (state)** | [ListenFor] | Yes — lifecycle-aware |
- * | **Listen (reaction)** | [ReactTo] | Yes — lifecycle-aware |
+ * | **Interception** | [Intercept] | Yes — lifecycle-aware |
+ * | **Interception (imperative)** | [addInterceptor] | No — returns [Registration] |
+ * | **Request** | [Request]`(impulse) { }` | Yes — lifecycle-aware |
+ * | **Listen (state)** | [ListenFor]`{ }` | Yes — lifecycle-aware |
+ * | **Listen (reaction)** | [ReactTo]`{ }` | Yes — lifecycle-aware |
+ * | **Flows** | [ListenFor]`()`, [ReactTo]`()`, [Request]`(impulse)` | No — return flows |
+ *
+ * [Broadcast], [Trigger] and the flow-returning overloads are inherited from
+ * [SynapseScope]; [switchboard] and [tag] come from the enclosing [contextScope].
  *
  * ### Lifecycle
  *
  * The scope is created when the [Node] enters the composition and
- * [disposed][dispose] when it leaves. Disposal:
- * 1. Unregisters all interceptors added via [Intercept].
- * 2. Clears the internal registration list.
+ * [disposed][dispose] when it leaves. Disposal unregisters every interceptor
+ * added via [addInterceptor]; afterwards [addInterceptor] unregisters new
+ * registrations immediately (see [isDisposed]).
  *
- * Long-lived listeners ([ListenFor], [ReactTo], [Request]) are managed via
- * [DisposableEffect] and canceled automatically when their keys change or
- * the composable is removed.
+ * Long-lived listeners ([ListenFor], [ReactTo], [Request]) and composable
+ * interceptors ([Intercept]) are managed via [DisposableEffect] and canceled
+ * automatically when their keys change or the composable is removed.
  *
  * @param C the context type from the enclosing [ContextScope].
  * @param S the local state type.
@@ -327,32 +293,43 @@ class NodeScope<C, S : Any>(
     val contextScope: ContextScope<C>,
     val stateHolder: MutableState<S>,
     val scope: CoroutineScope,
-) {
+) : SynapseScope() {
     val context: C get() = contextScope.context
     val state: S get() = stateHolder.value
 
     /** The [SwitchBoard] inherited from the enclosing [ContextScope]. */
-    @PublishedApi
-    internal val switchboard: SwitchBoard get() = contextScope.switchboard
+    override val switchboard: SwitchBoard get() = contextScope.switchboard
+
+    /** The trace tag inherited from the enclosing [ContextScope]. */
+    override val tag: String? get() = contextScope.tag
+
+    private val tracker = RegistrationTracker()
 
     /**
-     * Accumulated interceptor registrations that will be
-     * [unregistered][Registration.unregister] on [dispose].
+     * Interceptor registrations made via [addInterceptor] that will be
+     * [unregistered][Registration.unregister] on [dispose]. Synchronized list.
      */
-    @PublishedApi
-    internal val registrations = mutableListOf<Registration>()
+    internal val registrations: MutableList<Registration> get() = tracker.registrations
+
+    /** `true` once [dispose] has run. */
+    val isDisposed: Boolean get() = tracker.isDisposed
 
     /**
-     * Tears down this scope by unregistering all interceptors.
+     * Tears down this scope by unregistering all interceptors added via
+     * [addInterceptor]. Idempotent and thread-safe.
      *
      * Called automatically by the [DisposableEffect] inside [Node] when the
      * node leaves the composition. Should not normally be called manually.
      */
     @PublishedApi
     internal fun dispose() {
-        registrations.forEach { it.unregister() }
-        registrations.clear()
+        tracker.dispose()
     }
+
+    /** Tracks [registration] for disposal; see [RegistrationTracker.track]. */
+    @PublishedApi
+    internal fun trackRegistration(registration: Registration): Registration =
+        tracker.track(registration)
 
     // ── State Update ────────────────────────────────────────────────────
 
@@ -374,81 +351,101 @@ class NodeScope<C, S : Any>(
         stateHolder.value = reducer(stateHolder.value)
     }
 
-    // ── Interceptor Registration (lifecycle-aware) ──────────────────────
+    // ── Interceptor Registration ────────────────────────────────────────
 
     /**
-     * Registers an [interceptor] at the given [point] for data of type [T],
-     * automatically unregistering it when this node is disposed.
+     * Installs an [interceptor] at the given [point] for data of type [T] for
+     * as long as this call stays in the composition.
+     *
+     * The interceptor is registered **once** per distinct ([point],
+     * [priority], [key]) and unregistered when the call leaves the composition
+     * or one of those values changes. Recompositions do not re-register; the
+     * most recent [interceptor] instance passed in is always the one invoked
+     * (it is held via [rememberUpdatedState]), so capturing fresh state in
+     * the lambda is safe:
      *
      * ```kotlin
      * Node(initialState = MyState()) {
      *     Intercept<NetworkRequest>(
      *         point = InterceptPoint(Channel.REQUEST, Direction.UPSTREAM),
-     *         interceptor = Interceptor.transform { req -> req.copy(token = authToken) },
+     *         interceptor = Interceptor.transform { req -> req.copy(token = state.authToken) },
      *     )
      * }
      * ```
+     *
+     * This is `@Composable`; from callbacks or coroutines use [addInterceptor].
      *
      * @param T           the data type the interceptor operates on.
      * @param point       the [InterceptPoint] (channel and direction) to intercept.
      * @param interceptor the [Interceptor] to install.
      * @param priority    execution priority; lower values run first. Defaults to `0`.
+     * @param key         re-registration key; change it to remove and re-add
+     *                    the interceptor. Defaults to [Unit] (stable).
      */
     @Suppress("FunctionName")
+    @Composable
     inline fun <reified T : Any> Intercept(
         point: InterceptPoint,
         interceptor: Interceptor<T>,
         priority: Int = 0,
+        key: Any? = Unit,
     ) {
-        val registration = switchboard.addInterceptor(point, T::class, interceptor, priority)
-        registrations.add(registration)
+        InterceptEffect(T::class, point, interceptor, priority, key)
     }
 
-    // ── Imperative Actions (NOT @Composable) ────────────────────────────
-    // Call these from callbacks, event handlers, or inside LaunchedEffect.
-
-    /**
-     * Broadcasts [data] into the [SwitchBoard]'s state channel.
-     *
-     * This is a **suspending, non-composable** function. Call it from a
-     * coroutine (e.g., inside `LaunchedEffect` or `scope.launch`):
-     *
-     * ```kotlin
-     * LaunchedEffect(Unit) {
-     *     Broadcast(UserProfile(name = "Alice"))
-     * }
-     * ```
-     *
-     * Upstream state interceptors are applied before emission.
-     *
-     * @param O    the state type (inferred).
-     * @param data the value to broadcast.
-     */
-    @Suppress("FunctionName")
-    suspend inline fun <reified O : Any> Broadcast(data: O) {
-        contextScope.Broadcast(data)
+    /** Non-reified body of [Intercept]. */
+    @PublishedApi
+    @Composable
+    internal fun <T : Any> InterceptEffect(
+        clazz: KClass<T>,
+        point: InterceptPoint,
+        interceptor: Interceptor<T>,
+        priority: Int,
+        key: Any?,
+    ) {
+        val current = rememberUpdatedState(interceptor)
+        DisposableEffect(this, point, clazz, priority, key) {
+            val registration = switchboard.addInterceptor(
+                point,
+                clazz,
+                Interceptor { data, chain -> current.value.intercept(data, chain) },
+                priority,
+            )
+            onDispose { registration.unregister() }
+        }
     }
 
     /**
-     * Triggers a fire-and-forget [Impulse] on the [SwitchBoard]'s reaction channel.
+     * Imperatively registers an [interceptor] at the given [point] for data of
+     * type [T], automatically unregistering it when this node is disposed.
      *
-     * This is a **suspending, non-composable** function:
+     * Unlike [Intercept] this is **not** composable — every call registers a
+     * new interceptor, so call it from callbacks, effects, or coroutines, never
+     * directly from the composable body:
      *
      * ```kotlin
-     * Button(onClick = { scope.launch { Trigger(ShowToast("Saved!")) } }) {
-     *     Text("Save")
+     * LaunchedEffect(userId) {
+     *     val reg = addInterceptor(InterceptPoint.REACTION_UPSTREAM, tagWith<Analytics>(userId))
+     *     try { awaitCancellation() } finally { reg.unregister() }
      * }
      * ```
      *
-     * Upstream reaction interceptors are applied before emission.
+     * Thread-safe. If the node is already disposed, the interceptor is
+     * unregistered immediately and the returned handle is inert.
      *
-     * @param A     the [Impulse] subtype (inferred).
-     * @param event the impulse event to emit.
+     * @param T           the data type the interceptor operates on.
+     * @param point       the [InterceptPoint] (channel and direction) to intercept.
+     * @param interceptor the [Interceptor] to install.
+     * @param priority    execution priority; lower values run first. Defaults to `0`.
+     * @return a [Registration]; calling [Registration.unregister] removes the
+     *         interceptor and stops tracking it.
      */
-    @Suppress("FunctionName")
-    suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        contextScope.Trigger(event)
-    }
+    inline fun <reified T : Any> addInterceptor(
+        point: InterceptPoint,
+        interceptor: Interceptor<T>,
+        priority: Int = 0,
+    ): Registration =
+        trackRegistration(switchboard.addInterceptor(point, T::class, interceptor, priority))
 
     // ── Side Effects (lifecycle-aware, @Composable) ─────────────────────
 
@@ -477,6 +474,7 @@ class NodeScope<C, S : Any>(
      *                 Wrapped with [rememberUpdatedState] so the latest lambda
      *                 is always called, even if the enclosing scope recomposes.
      */
+    @Suppress("FunctionName")
     @Composable
     inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
         impulse: I,
@@ -485,7 +483,7 @@ class NodeScope<C, S : Any>(
     ) {
         val currentCallback by rememberUpdatedState(callback)
         DisposableEffect(this, key) {
-            val stateFlow = switchboard.handleRequest(I::class, Need::class, impulse)
+            val stateFlow = traced(switchboard.handleRequest(I::class, Need::class, impulse))
 
             val job = scope.launch {
                 stateFlow.collect { currentCallback(it) }
@@ -513,6 +511,7 @@ class NodeScope<C, S : Any>(
      * @param handler     invoked for each received impulse. Wrapped with
      *                    [rememberUpdatedState] for safe recomposition.
      */
+    @Suppress("FunctionName")
     @Composable
     inline fun <reified A : Impulse> ReactTo(
         reactionKey: Any? = Unit,
@@ -550,6 +549,7 @@ class NodeScope<C, S : Any>(
      * @param handler  invoked for each (intercepted) state value. Wrapped with
      *                 [rememberUpdatedState] for safe recomposition.
      */
+    @Suppress("FunctionName")
     @Composable
     inline fun <reified O : Any> ListenFor(
         stateKey: Any? = Unit,

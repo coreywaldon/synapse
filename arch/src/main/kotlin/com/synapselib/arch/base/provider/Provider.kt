@@ -1,14 +1,11 @@
 package com.synapselib.arch.base.provider
 
 import com.synapselib.arch.base.DataImpulse
-import com.synapselib.core.typed.DataState
-import com.synapselib.arch.base.Impulse
 import com.synapselib.arch.base.SwitchBoard
-import com.synapselib.arch.base.broadcastState
-import com.synapselib.arch.base.triggerImpulse
+import com.synapselib.arch.base.SynapseScope
+import com.synapselib.core.typed.DataState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.SharedFlow
 
 /**
  * A cold-start data producer that handles a specific [com.synapselib.arch.base.DataImpulse] type.
@@ -99,6 +96,9 @@ abstract class Provider<I : DataImpulse<Need>, Need : Any> {
  * The provider does not control when this scope is created or destroyed —
  * the [ProviderManager] handles that based on subscriber demand.
  *
+ * The SwitchBoard verbs — [ListenFor]`()`, [ReactTo]`()`, [Broadcast],
+ * [Trigger] and nested [Request]s — are inherited from [SynapseScope].
+ *
  * Implements [CoroutineScope] by delegation, so standard coroutine builders
  * (`launch`, `async`) are available inside [Provider.produce]:
  *
@@ -110,57 +110,25 @@ abstract class Provider<I : DataImpulse<Need>, Need : Any> {
  * }
  * ```
  *
+ * ### Tracing
+ *
+ * Providers run in the [ProviderManager]'s coroutine, which is shared
+ * (deduplicated) across every requester of the same impulse, so the
+ * requester's [com.synapselib.arch.base.TraceContext] is **not** propagated
+ * into [Provider.produce]. Pass a [tag] to have the provider's own emissions
+ * traced as root trace points (or as children of any trace you establish
+ * yourself inside `produce`, e.g. via [com.synapselib.arch.base.withTrace]).
+ *
  * @param switchboard    the [com.synapselib.arch.base.SwitchBoard] for cross-component communication.
  * @param coroutineScope the backing scope; canceled when the provider is disposed.
+ * @param tag            optional emitter label for [com.synapselib.arch.base.TraceContext].
+ *                       `null` (the default) disables tracing for this scope.
  */
 class ProviderScope(
-    val switchboard: SwitchBoard,
+    override val switchboard: SwitchBoard,
     coroutineScope: CoroutineScope,
-) : CoroutineScope by coroutineScope {
-
-    // ── State Observation ───────────────────────────────────────────────
-
-    /**
-     * Returns the downstream-intercepted [SharedFlow] for state of type [O].
-     */
-    inline fun <reified O : Any> ListenFor(): SharedFlow<O> =
-        switchboard.stateFlow(O::class)
-
-    /**
-     * Returns the downstream-intercepted [SharedFlow] for impulses of type [A].
-     */
-    inline fun <reified A : Impulse> ReactTo(): SharedFlow<A> =
-        switchboard.impulseFlow(A::class)
-
-    // ── Imperative Actions ──────────────────────────────────────────────
-
-    /**
-     * Broadcasts [data] into the [SwitchBoard]'s state channel.
-     */
-    suspend inline fun <reified O : Any> Broadcast(data: O) {
-        switchboard.broadcastState(data)
-    }
-
-    /**
-     * Triggers a fire-and-forget [Impulse] through the [SwitchBoard].
-     */
-    suspend inline fun <reified A : Impulse> Trigger(event: A) {
-        switchboard.triggerImpulse(event)
-    }
-
-    // ── Nested Requests ─────────────────────────────────────────────────
-
-    /**
-     * Issues a nested data request through the [SwitchBoard].
-     *
-     * Allows providers to depend on other providers' data. The returned
-     * flow carries the full [DataState] lifecycle of the nested request.
-     */
-    inline fun <reified Need : Any, reified I : DataImpulse<Need>> Request(
-        impulse: I,
-    ): Flow<DataState<Need>> =
-        switchboard.handleRequest(I::class, Need::class, impulse)
-}
+    override val tag: String? = null,
+) : SynapseScope(), CoroutineScope by coroutineScope
 
 /**
  * Factory function type for creating [Provider] instances on demand.
