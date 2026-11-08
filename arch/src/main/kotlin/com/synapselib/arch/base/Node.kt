@@ -148,6 +148,9 @@ class ContextScope<T>(
  * which unregisters any interceptors added via [NodeScope.addInterceptor]
  * ([NodeScope.Intercept] registrations are owned by their own effects).
  *
+ * The local state is held by [rememberState]: a `@Serializable` [S] survives configuration
+ * changes and process death, including [DataState] properties.
+ *
  * ### Usage
  *
  * ```kotlin
@@ -234,6 +237,42 @@ inline fun <reified S : Any> serializerOrNull(): KSerializer<S>? {
     return result
 }
 
+/**
+ * Holds a [Node]'s local state, saving it across configuration changes and process death when
+ * [S] is `@Serializable`.
+ *
+ * If [serializerOrNull] finds a serializer for [S], the state is kept in `rememberSaveable` with a
+ * `Saver` that encodes it to a JSON string (`Json.encodeToString(serializer, state)`) and decodes
+ * it on restore. Otherwise it is a plain `remember { mutableStateOf(initialState) }` that is lost
+ * when the Activity is recreated.
+ *
+ * Fetched data can stay wrapped in [DataState]: it is `@Serializable` (see
+ * [DataStateSerializer][com.synapselib.core.typed.DataStateSerializer]), so a state class such as
+ *
+ * ```kotlin
+ * @Serializable
+ * data class ProductListState(
+ *     val products: DataState<List<Product>> = DataState.Idle,
+ *     val searchQuery: String = "",
+ * )
+ * ```
+ *
+ * saves every variant, provided `Product` is `@Serializable` too. [DataState.Idle] and
+ * [DataState.Loading] restore as themselves; a [DataState.Error] restores with its `staleData`
+ * and a [RestoredDataStateException][com.synapselib.core.typed.RestoredDataStateException] cause
+ * carrying the original exception's class name and message (the exception itself — identity,
+ * type, stack trace — is not saved). After restoration a live [NodeScope.Request] runs again and
+ * replaces the restored value with the real state.
+ *
+ * Every other property of [S] must be serializable as well. Beware of a property typed as an
+ * interface that is not itself `@Serializable`: the plugin compiles it as polymorphic, and saving
+ * then throws a `SerializationException` once it holds a non-default value — how `DataState` crashed
+ * on save before 1.1.0.
+ *
+ * @param S            the state type.
+ * @param initialState the value used on first composition, and whenever no saved value exists.
+ * @return the state holder; [Node] wraps it in a [NodeScope].
+ */
 @Composable
 inline fun <reified S : Any> rememberState(
     initialState: S,

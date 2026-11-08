@@ -192,6 +192,21 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
 - **core:** `Flow.gate(condition: Flow<Boolean>, …)` overload (any boolean flow, not only a
   `StateFlow`), `Flow.chunk(period, maxBufferSize)` overload, and `!flow` (`not` is now an
   `operator`).
+- **core:** `DataState` is `@Serializable` (`@Serializable(with = DataStateSerializer::class)`), so a
+  `@Serializable` class can hold a `DataState<T>` property whenever `T` is serializable — this is
+  what makes `@Serializable` Node state holding `DataState` save correctly (see Fixed). New public
+  types in `com.synapselib.core.typed`:
+  - `DataStateSerializer<T : Any>(dataSerializer: KSerializer<T>)`: encodes each variant as a small
+    structure discriminated by `state` — `{"state":"idle"}`, `{"state":"loading"}`,
+    `{"state":"success","data":…}`, `{"state":"error","message":"…","type":"java.io.IOException","staleData":…}`.
+    `Idle` / `Loading` decode to the same singletons. The serialization plugin also generates
+    `DataState.serializer(typeSerial0)` (on the new `DataState.Companion`).
+  - `RestoredDataStateException(originalType: String?, message: String?)`: the `cause` of a
+    `DataState.Error` after it is decoded. A `Throwable` is not serializable, so only the original
+    cause's class name and message survive a save/restore; its identity, type and stack trace do
+    not. `staleData` is preserved. A live `Request` re-emits the real state after restoration.
+    Instances with the same `originalType` and `message` are equal, and re-encoding one writes the
+    original `type`, so repeated save/restore cycles are stable.
 - CI workflow for pull requests and non-`main` pushes.
 
 ### Changed
@@ -205,6 +220,10 @@ Coordinator(switchboard, applicationScope, tag = "Sync") {
 - `arch` now exposes `core`, `kotlinx-coroutines-core`, Compose runtime, `lifecycle-common` and
   `javax.inject` as `api` dependencies, because their types appear in its public API.
   `javax.inject:javax.inject:1` is declared explicitly.
+- **core now depends on `org.jetbrains.kotlinx:kotlinx-serialization-core`** (1.8.1, `api`), because
+  `DataState` is `@Serializable` and `DataStateSerializer` is public API. core is compiled with the
+  kotlinx.serialization compiler plugin. Apps using `arch` already had it at runtime (through
+  `arch`'s `kotlinx-serialization-json`); it is now also on their compile classpath.
 - **Tracing:**
   - When a tagged scope emits inside a coroutine that already carries a `TraceContext`, the new
     trace's `parentTraceId` is set to that ambient `traceId`. It was always `null` before.
@@ -281,6 +300,12 @@ Hidden (`DeprecationLevel.HIDDEN`) bridges keep the original JVM signatures of t
 - Stray `}` in the "DataImpulse must be a data class" error message.
 
 **arch**
+- Saving `@Serializable` Node state that holds a `DataState` crashed the app on rotation or
+  backgrounding with `SerializationException: Serializer for subclass 'Success' is not found in the
+  polymorphic scope of 'DataState'` (likewise `Loading` / `Error`) — the pattern the README
+  documents (`val products: DataState<List<Product>> = DataState.Idle`). `DataState` was a plain
+  sealed interface, so the serialization plugin compiled such properties as polymorphic.
+  `DataState` is now serializable (see Added) and `rememberState` saves and restores every variant.
 - Binary compatibility with libraries compiled against 1.0.x: `CoordinatorScope.getRegistrations()`,
   `getLifecycleRegistrations()`, `addLifecycleEventRegistration(...)`, `NodeScope.getRegistrations()`,
   the 1.0.x non-composable `NodeScope.Intercept(point, interceptor, priority)` (now hidden,

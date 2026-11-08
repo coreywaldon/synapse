@@ -36,4 +36,11 @@ dependencies {
 
     testImplementation(libs.kotlinxCoroutinesTest)
     testImplementation(libs.junitJupiter)
+
+    // The kotlinx.serialization compiler plugin, for the TEST compilation only: the state-persistence
+    // tests declare `@Serializable` Node state classes exactly as an app would. arch's own (published)
+    // classes declare nothing `@Serializable`, so the main compilation deliberately stays plugin-free
+    // and its bytecode — notably the inline `rememberState` / `serializerOrNull` that consumers
+    // inline — is unchanged. (Applying the Gradle plugin would enable it for main as well.)
+    kotlinCompilerPluginClasspathTest(libs.kotlinSerializationCompilerPlugin)
 }
