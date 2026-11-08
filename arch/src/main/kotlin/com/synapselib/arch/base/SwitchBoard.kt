@@ -521,7 +521,15 @@ class DefaultSwitchBoard(
 
     /** Provider lifecycle manager — handles cold-start, dedup, concurrency. */
     private val providerManager =
-        ProviderManager(providerRegistry, boardScope, config.workerContext, config.maxConcurrentJobs)
+        ProviderManager(
+            providerRegistry,
+            boardScope,
+            config.workerContext,
+            config.maxConcurrentJobs,
+            idleTimeoutMillis = config.providerIdleTimeout.let {
+                if (it.isInfinite()) Long.MAX_VALUE else it.inWholeMilliseconds
+            },
+        )
 
     // ── Sharing strategy ────────────────────────────────────────────────
 

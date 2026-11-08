@@ -63,6 +63,10 @@ import kotlin.time.Duration.Companion.seconds
  *                                  [BufferOverflow.SUSPEND] applies back-pressure.
  * @property maxConcurrentJobs      maximum number of simultaneously active
  *                                  provider jobs. `0` means unbounded.
+ * @property providerIdleTimeout    how long a provider job keeps running after its
+ *                                  last collector leaves before it is cancelled and
+ *                                  its dedup entry evicted. Defaults to [stopTimeout];
+ *                                  [Duration.INFINITE] disables idle teardown.
  * @property workerContext          the [CoroutineContext] provider jobs run in.
  */
 class SwitchBoardConfig private constructor(builder: Builder) {
@@ -74,10 +78,14 @@ class SwitchBoardConfig private constructor(builder: Builder) {
     val reactionBufferCapacity: Int = builder.reactionBufferCapacity
     val reactionOverflow: BufferOverflow = builder.reactionOverflow
     val maxConcurrentJobs: Int = builder.maxConcurrentJobs
+    val providerIdleTimeout: Duration = builder.providerIdleTimeout ?: stopTimeout
     val workerContext: CoroutineContext = builder.workerContext
 
     /** The explicitly configured strategy, kept so [newBuilder] round-trips faithfully. */
     private val customSharingStarted: SharingStarted? = builder.sharingStarted
+
+    /** The explicitly configured idle timeout, kept so [newBuilder] round-trips faithfully. */
+    private val customProviderIdleTimeout: Duration? = builder.providerIdleTimeout
 
     init {
         require(!stopTimeout.isNegative()) { "stopTimeout must be >= 0, was $stopTimeout" }
@@ -90,6 +98,9 @@ class SwitchBoardConfig private constructor(builder: Builder) {
                 "(a reaction channel without a buffer cannot drop values), was $reactionOverflow"
         }
         require(maxConcurrentJobs >= 0) { "maxConcurrentJobs must be >= 0, was $maxConcurrentJobs" }
+        require(!providerIdleTimeout.isNegative()) {
+            "providerIdleTimeout must be >= 0, was $providerIdleTimeout"
+        }
     }
 
     /** Returns a [Builder] pre-populated with this configuration's values. */
@@ -100,6 +111,7 @@ class SwitchBoardConfig private constructor(builder: Builder) {
         it.reactionBufferCapacity = reactionBufferCapacity
         it.reactionOverflow = reactionOverflow
         it.maxConcurrentJobs = maxConcurrentJobs
+        it.providerIdleTimeout = customProviderIdleTimeout
         it.workerContext = workerContext
     }
 
@@ -119,6 +131,7 @@ class SwitchBoardConfig private constructor(builder: Builder) {
             reactionBufferCapacity == other.reactionBufferCapacity &&
             reactionOverflow == other.reactionOverflow &&
             maxConcurrentJobs == other.maxConcurrentJobs &&
+            customProviderIdleTimeout == other.customProviderIdleTimeout &&
             workerContext == other.workerContext
 
     override fun hashCode(): Int {
@@ -128,6 +141,7 @@ class SwitchBoardConfig private constructor(builder: Builder) {
         result = 31 * result + reactionBufferCapacity
         result = 31 * result + reactionOverflow.hashCode()
         result = 31 * result + maxConcurrentJobs
+        result = 31 * result + (customProviderIdleTimeout?.hashCode() ?: 0)
         result = 31 * result + workerContext.hashCode()
         return result
     }
@@ -136,6 +150,7 @@ class SwitchBoardConfig private constructor(builder: Builder) {
         "SwitchBoardConfig(stopTimeout=$stopTimeout, replayExpiration=$replayExpiration, " +
             "sharingStarted=$sharingStarted, reactionBufferCapacity=$reactionBufferCapacity, " +
             "reactionOverflow=$reactionOverflow, maxConcurrentJobs=$maxConcurrentJobs, " +
+            "providerIdleTimeout=$providerIdleTimeout, " +
             "workerContext=$workerContext)"
 
     // ── Builder ─────────────────────────────────────────────────────────
@@ -165,6 +180,12 @@ class SwitchBoardConfig private constructor(builder: Builder) {
 
         /** See [SwitchBoardConfig.maxConcurrentJobs]. Default: `0` (unbounded). */
         var maxConcurrentJobs: Int = 0
+
+        /**
+         * See [SwitchBoardConfig.providerIdleTimeout]. `null` (default) uses
+         * [stopTimeout], so provider jobs and downstream flows wind down together.
+         */
+        var providerIdleTimeout: Duration? = null
 
         /** See [SwitchBoardConfig.workerContext]. Default: [Dispatchers.IO]. */
         var workerContext: CoroutineContext = Dispatchers.IO
