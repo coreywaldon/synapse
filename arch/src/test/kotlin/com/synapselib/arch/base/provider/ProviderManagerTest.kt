@@ -26,6 +26,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -42,6 +43,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 
 /**
@@ -658,8 +660,10 @@ class ProviderManagerTest {
     fun `dispose cancels all jobs and makes further requests fail fast`() = runTest {
         val probe = Probe()
         val f = fixture(registry(probe))
-        f.collectInto(f.watch("a"))
-        f.collectInto(f.watch("b"))
+        // Active collectors are terminated by dispose(); see the Termination section below.
+        val failures = CopyOnWriteArrayList<Throwable>()
+        f.collectCatching(f.watch("a")) { failures += it }
+        f.collectCatching(f.watch("b")) { failures += it }
         runCurrent()
         assertEquals(2, f.manager.activeJobCount)
         assertFalse(f.manager.isDisposed)
@@ -669,6 +673,7 @@ class ProviderManagerTest {
 
         assertTrue(f.manager.isDisposed)
         assertEquals(2, probe.stopped.get())
+        assertEquals(2, failures.size, "both collectors terminated")
         assertEquals(0, f.manager.activeJobCount)
         assertThrows(IllegalStateException::class.java) { f.watch("c") }
 
@@ -705,5 +710,232 @@ class ProviderManagerTest {
         assertThrows(IllegalStateException::class.java) {
             manager.request(Fetch::class, Result::class, Fetch("x"), switchboard)
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Zero idle timeout
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `zero idle timeout with an unconfined worker serves the first collector`() = runBlocking {
+        val probe = Probe()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val switchboard = DefaultSwitchBoard(scope, ProviderRegistry.EMPTY, Dispatchers.Unconfined)
+            val manager = ProviderManager(registry(probe), scope, Dispatchers.Unconfined, idleTimeoutMillis = 0)
+
+            val fetched = withTimeout(5_000) {
+                manager.request(Fetch::class, Result::class, Fetch("a"), switchboard)
+                    .first { it is DataState.Success }
+            }
+            assertEquals(DataState.Success(Result("fetched a")), fetched)
+
+            val watched = withTimeout(5_000) {
+                manager.request(Watch::class, Result::class, Watch("w"), switchboard)
+                    .first { it is DataState.Success }
+            }
+            assertEquals(DataState.Success(Result("watching w")), watched)
+            assertEquals(2, probe.instances.get(), "each provider is created exactly once")
+
+            // The last (only) collector left: a zero timeout tears down right away.
+            withTimeout(5_000) { while (manager.activeJobCount != 0 || probe.stopped.get() != 1) delay(1) }
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `zero idle timeout on UnconfinedTestDispatcher tears down only once the last collector leaves`() = runTest {
+        val probe = Probe()
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        try {
+            val switchboard = DefaultSwitchBoard(scope, ProviderRegistry.EMPTY, dispatcher)
+            val manager = ProviderManager(registry(probe), scope, dispatcher, idleTimeoutMillis = 0)
+
+            val received = CopyOnWriteArrayList<DataState<Result>>()
+            val collector = scope.launch {
+                manager.request(Watch::class, Result::class, Watch("k"), switchboard).collect { received += it }
+            }
+            runCurrent()
+            assertEquals(listOf(DataState.Loading, DataState.Success(Result("watching k"))), received.toList())
+            assertEquals(1, probe.instances.get())
+
+            advanceTimeBy(10_000)
+            runCurrent()
+            assertEquals(0, probe.stopped.get(), "an active collector keeps the provider alive")
+
+            collector.cancel()
+            runCurrent()
+            assertEquals(1, probe.stopped.get(), "torn down as soon as the last collector leaves")
+            assertEquals(0, manager.activeJobCount)
+
+            // Never collected: discarded at the next opportunity, provider never created.
+            manager.request(Watch::class, Result::class, Watch("orphan"), switchboard)
+            runCurrent()
+            assertEquals(0, manager.activeJobCount)
+            assertEquals(1, probe.instances.get())
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `zero idle timeout on a dispatching worker never tears down before the first collector`() = runTest {
+        val probe = Probe()
+        val f = fixture(registry(probe), idleTimeoutMillis = 0)
+        val received = CopyOnWriteArrayList<DataState<Result>>()
+        val collector = f.collectInto(f.watch("k"), received)
+        runCurrent()
+        assertEquals(listOf(DataState.Loading, DataState.Success(Result("watching k"))), received.toList())
+        assertEquals(1, probe.instances.get())
+
+        collector.cancel()
+        runCurrent()
+        assertEquals(1, probe.stopped.get())
+        assertEquals(0, f.manager.activeJobCount)
+    }
+
+    @Test
+    fun `zero idle timeout on a multi-threaded worker creates each provider exactly once`() = runBlocking {
+        val probe = Probe()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val switchboard = DefaultSwitchBoard(scope, ProviderRegistry.EMPTY, Dispatchers.Default)
+            val manager = ProviderManager(registry(probe), scope, Dispatchers.Default, idleTimeoutMillis = 0)
+            val rounds = 200
+            withTimeout(30_000) {
+                repeat(rounds) { i ->
+                    val state = manager.request(Watch::class, Result::class, Watch("k$i"), switchboard)
+                        .first { it is DataState.Success }
+                    assertEquals(DataState.Success(Result("watching k$i")), state)
+                }
+            }
+            assertEquals(rounds, probe.instances.get(), "no provider is re-created")
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Termination of active collectors
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Collects [flow] in the fixture scope, reporting the [IllegalStateException] that ends collection. */
+    private fun <T : Any> Fixture.collectCatching(
+        flow: Flow<DataState<T>>,
+        sink: MutableList<DataState<T>> = CopyOnWriteArrayList(),
+        onFailure: (Throwable) -> Unit,
+    ): Job = scope.launch {
+        try {
+            flow.collect { sink += it }
+        } catch (e: IllegalStateException) {
+            onFailure(e)
+        }
+    }
+
+    @Test
+    fun `dispose terminates active streaming collectors with IllegalStateException`() = runTest {
+        val probe = Probe()
+        val f = fixture(registry(probe))
+        var failure: Throwable? = null
+        val received = CopyOnWriteArrayList<DataState<Result>>()
+        val collector = f.collectCatching(f.watch("a"), received) { failure = it }
+        runCurrent()
+        assertEquals(DataState.Success(Result("watching a")), received.last())
+
+        f.manager.dispose()
+        runCurrent()
+        assertTrue(collector.isCompleted, "collector must not hang after dispose")
+        val error = assertInstanceOf(IllegalStateException::class.java, failure)
+        assertTrue(error.message.orEmpty().contains("disposed"), error.message)
+        assertEquals(1, probe.stopped.get())
+    }
+
+    @Test
+    fun `a collector of a completed one-shot job keeps collecting until dispose`() = runTest {
+        val f = fixture(registry())
+        var failure: Throwable? = null
+        val received = CopyOnWriteArrayList<DataState<Result>>()
+        val collector = f.collectCatching(f.fetch("a"), received) { failure = it }
+        advanceUntilIdle()
+        assertEquals(listOf(DataState.Loading, DataState.Success(Result("fetched a"))), received.toList())
+        assertFalse(collector.isCompleted, "normal completion does not terminate collectors")
+
+        f.manager.dispose()
+        runCurrent()
+        assertTrue(collector.isCompleted)
+        assertInstanceOf(IllegalStateException::class.java, failure)
+    }
+
+    @Test
+    fun `a late collector of a completed one-shot flow receives the replayed final state`() = runTest {
+        val probe = Probe()
+        val f = fixture(registry(probe))
+        val flow = f.fetch("a")
+        f.collectInto(flow)
+        advanceUntilIdle()
+        assertEquals(0, f.manager.activeJobCount)
+
+        assertEquals(DataState.Success(Result("fetched a")), flow.first())
+        assertEquals(1, probe.instances.get(), "replayed, not re-requested")
+    }
+
+    @Test
+    fun `collecting a completed one-shot flow after dispose fails with IllegalStateException`() = runTest {
+        val f = fixture(registry())
+        val completed = f.fetch("done")
+        f.collectCatching(completed) { }
+        advanceUntilIdle()
+        f.manager.dispose()
+        runCurrent()
+
+        var failure: Throwable? = null
+        val collector = f.collectCatching(completed) { failure = it }
+        runCurrent()
+        assertTrue(collector.isCompleted)
+        assertInstanceOf(IllegalStateException::class.java, failure)
+    }
+
+    @Test
+    fun `parent scope cancellation terminates collectors living in another scope`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val parent = CoroutineScope(SupervisorJob() + dispatcher)
+        val f = fixture(registry())
+        val manager = ProviderManager(registry(), parent, dispatcher)
+
+        var failure: Throwable? = null
+        val collector = f.scope.launch {
+            try {
+                manager.request(Watch::class, Result::class, Watch("a"), f.switchboard).collect { }
+            } catch (e: IllegalStateException) {
+                failure = e
+            }
+        }
+        runCurrent()
+        assertEquals(1, manager.activeJobCount)
+
+        parent.cancel()
+        runCurrent()
+        assertTrue(collector.isCompleted, "collector must not hang after its job's parent is cancelled")
+        assertInstanceOf(IllegalStateException::class.java, failure)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Binary compatibility
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `legacy four-argument constructor JVM signatures are preserved`() {
+        val cls = ProviderManager::class.java
+        val int = Int::class.javaPrimitiveType
+        cls.getConstructor(
+            ProviderRegistry::class.java, CoroutineScope::class.java, CoroutineContext::class.java, int,
+        )
+        // The synthetic `$default` constructor that Kotlin callers compiled against 1.x invoke.
+        val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
+        cls.getDeclaredConstructor(
+            ProviderRegistry::class.java, CoroutineScope::class.java, CoroutineContext::class.java, int, int, marker,
+        )
     }
 }

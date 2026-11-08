@@ -4,6 +4,7 @@ import androidx.compose.runtime.compositionLocalOf
 import com.synapselib.arch.base.internal.ChannelStore
 import com.synapselib.arch.base.internal.DownstreamStage
 import com.synapselib.arch.base.provider.ProviderManager
+import com.synapselib.arch.base.provider.ProviderManagerClosedException
 import com.synapselib.arch.base.provider.ProviderRegistry
 import com.synapselib.core.typed.DataState
 import com.synapselib.core.typed.TypedSharedFlow
@@ -676,6 +677,9 @@ class DefaultSwitchBoard(
     /**
      * See [SwitchBoard.handleRequest].
      *
+     * A collection that is already running when the board is closed (or its
+     * scope is cancelled) completes normally instead of hanging.
+     *
      * @throws IllegalStateException if the board is closed — both when called
      *         and when the returned flow is collected.
      */
@@ -701,25 +705,32 @@ class DefaultSwitchBoard(
                 return@flow
             }
 
-            providerFlow.collect { state ->
-                when (state) {
-                    is DataState.Success<Need> -> {
-                        val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state.data)
-                        emit(DataState.Success(interceptedData))
-                    }
-
-                    is DataState.Error<Need> -> {
-                        val staleData = state.staleData
-                        if (staleData != null) {
-                            val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, staleData)
-                            emit(DataState.Error(state.cause, interceptedData))
-                        } else {
-                            emit(DataState.Error(state.cause, null))
+            try {
+                providerFlow.collect { state ->
+                    when (state) {
+                        is DataState.Success<Need> -> {
+                            val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, state.data)
+                            emit(DataState.Success(interceptedData))
                         }
-                    }
 
-                    else -> emit(state)
+                        is DataState.Error<Need> -> {
+                            val staleData = state.staleData
+                            if (staleData != null) {
+                                val interceptedData = processAndLog(InterceptPoint.REQUEST_DOWNSTREAM, needType, staleData)
+                                emit(DataState.Error(state.cause, interceptedData))
+                            } else {
+                                emit(DataState.Error(state.cause, null))
+                            }
+                        }
+
+                        else -> emit(state)
+                    }
                 }
+            } catch (e: ProviderManagerClosedException) {
+                // The board was closed (or its scope cancelled) while collecting:
+                // end this request stream normally rather than failing collectors
+                // that are still running (e.g. a LaunchedEffect outliving the board).
+                if (e.owner !== providerManager) throw e
             }
         }
     }
@@ -871,6 +882,8 @@ class DefaultSwitchBoard(
      * throw [IllegalStateException]. Flows obtained **before** closing are not
      * completed (a [SharedFlow] never completes); they simply stop receiving
      * values, so their collectors should be cancelled by their own lifecycle.
+     * The exception is [handleRequest]: its running collections complete
+     * normally once the provider runtime is disposed.
      * Registering interceptors or observers remains allowed but has no effect.
      */
     override fun close() {

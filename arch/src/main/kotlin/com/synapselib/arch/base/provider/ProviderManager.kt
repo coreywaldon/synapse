@@ -89,12 +89,42 @@ import kotlin.reflect.KClass
  *   removed.
  *
  * Collecting a flow whose job has already been torn down transparently
- * issues a fresh [request] for the same impulse, so a returned flow never
- * silently hangs on a dead job. One-shot jobs that complete normally are not
- * torn down; a late collector still receives the replayed terminal state.
+ * attaches to a fresh job for the same impulse, so a returned flow never
+ * silently hangs on a dead job. That fresh job is created with the collector
+ * already registered, so no idle timer can tear it down before the collector
+ * subscribes; the hand-off is retried a bounded number of times and then
+ * fails with [IllegalStateException] instead of recursing. One-shot jobs that
+ * complete normally are not torn down; a late collector still receives the
+ * replayed terminal state.
+ *
+ * With `idleTimeoutMillis = 0` a job is torn down as soon as its last
+ * collector leaves, and never while a collector is attached. A request that
+ * is never collected is discarded at the worker's next opportunity (inline on
+ * an unconfined dispatcher); if it is collected after that, the collector
+ * simply attaches to a fresh job. The provider itself is never created for a
+ * job that was discarded before its first collector.
  *
  * All timers run on the worker dispatcher, so they honour
  * `kotlinx-coroutines-test` virtual time when a test dispatcher is supplied.
+ *
+ * ## Termination
+ *
+ * A flow returned by [request] never completes normally (it is a
+ * [SharedFlow]). Once this manager is [dispose]d — or its parent scope is
+ * cancelled — **every** collection of such a flow fails with
+ * [IllegalStateException]: collectors that are already running are
+ * terminated (rather than left suspended forever), and new collectors fail
+ * immediately, exactly as a new [request] does. This applies equally to
+ * flows of streaming jobs and of one-shot jobs that already completed.
+ * Until then, a one-shot job completing normally never terminates its
+ * collectors; they keep the replayed terminal state.
+ *
+ * Because [SharedFlow.collect] cannot return, the termination is an
+ * exception: an internal [IllegalStateException] subtype
+ * ([ProviderManagerClosedException]), never a `CancellationException`, so a
+ * running collector is not mistaken for a cancelled one. `DefaultSwitchBoard`
+ * catches it in `handleRequest`, so on the board a running request stream
+ * simply completes when the board is closed.
  *
  * ## Concurrency
  *
@@ -122,15 +152,40 @@ import kotlin.reflect.KClass
  *                          cancelled. Applies both to the wait for the first
  *                          collector and to the period after the last one
  *                          leaves. Must be `>= 0`; [Long.MAX_VALUE] disables
- *                          idle teardown.
+ *                          idle teardown. Omit it (use the four-argument
+ *                          constructor) for [DEFAULT_IDLE_TIMEOUT_MILLIS].
  */
 class ProviderManager(
     private val registry: ProviderRegistry,
     parentScope: CoroutineScope,
     workerContext: CoroutineContext = Dispatchers.IO,
     private val maxConcurrentJobs: Int = 0,
-    private val idleTimeoutMillis: Long = DEFAULT_IDLE_TIMEOUT_MILLIS,
+    // Deliberately required: a default here would replace the JVM signatures
+    // of the 1.0 constructor below and break binary compatibility.
+    private val idleTimeoutMillis: Long,
 ) {
+
+    /**
+     * Creates a manager with the default idle timeout
+     * ([DEFAULT_IDLE_TIMEOUT_MILLIS]).
+     *
+     * This is the 1.0 constructor, kept with its exact JVM signatures
+     * (`<init>(ProviderRegistry, CoroutineScope, CoroutineContext, int)` and
+     * its synthetic defaults variant) so code compiled against 1.0 keeps
+     * linking. Pass `idleTimeoutMillis` (by name) to choose another timeout.
+     *
+     * @param registry          the immutable [ProviderRegistry].
+     * @param parentScope       the parent [CoroutineScope] of every provider job.
+     * @param workerContext     the [CoroutineContext] providers and timers run on.
+     * @param maxConcurrentJobs maximum number of simultaneous live provider
+     *                          jobs; non-positive means unbounded.
+     */
+    constructor(
+        registry: ProviderRegistry,
+        parentScope: CoroutineScope,
+        workerContext: CoroutineContext = Dispatchers.IO,
+        maxConcurrentJobs: Int = 0,
+    ) : this(registry, parentScope, workerContext, maxConcurrentJobs, DEFAULT_IDLE_TIMEOUT_MILLIS)
 
     init {
         require(idleTimeoutMillis >= 0) {
@@ -207,69 +262,127 @@ class ProviderManager(
         impulse: I,
         switchboard: SwitchBoard,
     ): SharedFlow<DataState<Need>> {
-        check(!disposed.get()) {
-            "ProviderManager has been disposed; cannot process ${impulseType.simpleName}."
+        val lease = obtain(impulseType, needType, impulse, switchboard, attach = false)
+        return RefCountedFlow(lease) {
+            obtain(impulseType, needType, impulse, switchboard, attach = true)
         }
-        check(supervisor.isActive) {
-            "ProviderManager's parent scope has been cancelled; cannot process ${impulseType.simpleName}."
-        }
+    }
 
-        // ── Fast path: dedup onto a live job ────────────────────────
-        activeJobs[impulse]?.let { existing ->
-            if (existing.isLive) return existing.view(impulseType, needType, impulse, switchboard)
-        }
+    /**
+     * Resolves [impulse] to a live job (deduplicating or creating one) and
+     * returns a typed [Lease] on it.
+     *
+     * With [attach] `false` (a plain [request]) no collector is registered: a
+     * newly created job arms its "never collected" idle timer. With [attach]
+     * `true` (a collector re-attaching after its job died) a collector is
+     * registered on the returned job **before** anything can tear it down — a
+     * new job is created with one subscriber and no timer — so the caller can
+     * subscribe without racing the idle timer, whatever the timeout and
+     * dispatcher. The caller must later [ActiveJob.release] it.
+     *
+     * @return a [Lease]; its [Lease.entry] is `null` when the concurrency limit
+     *         rejected the request, and [Lease.flow] then replays the error.
+     * @throws IllegalStateException if this manager is disposed or its parent
+     *         scope is cancelled, or if no live job could be attached to after
+     *         [MAX_REATTACH_ATTEMPTS] attempts.
+     */
+    private fun <Need : Any, I : DataImpulse<Need>> obtain(
+        impulseType: KClass<I>,
+        needType: KClass<Need>,
+        impulse: I,
+        switchboard: SwitchBoard,
+        attach: Boolean,
+    ): Lease<Need> {
+        repeat(MAX_REATTACH_ATTEMPTS) {
+            checkUsable(impulseType)
 
-        // ── Resolve factory & verify types ──────────────────────────
-        val registered = registry.resolve(impulseType)
-            ?: throw NoProviderException(impulseType)
-        val producedClass = registered.needClass.kotlin.javaObjectType
-        require(needType.javaObjectType.isAssignableFrom(producedClass)) {
-            "Type mismatch for ${impulseType.qualifiedName}: its registered provider produces " +
-                    "${producedClass.name}, but the caller requested ${needType.qualifiedName}. " +
-                    "The requested Need type must be the provider's result type or a super-type of it."
-        }
-
-        // ── Atomic lookup-or-create ─────────────────────────────────
-        // The candidate is created LAZY (no dispatch, factory not invoked) so
-        // that losing the race below costs only an allocation.
-        val candidate = ActiveJob(impulse, impulseType, producedClass, registered, switchboard)
-        var winner: ActiveJob? = null
-        activeJobs.compute(impulse) { _, current ->
-            when {
-                current != null && current.isLive -> {
-                    winner = current
-                    current
-                }
-                tryAcquirePermit() -> {
-                    winner = candidate
-                    candidate
-                }
-                else -> current // over the limit — leave the table untouched
+            // ── Fast path: dedup onto a live job ────────────────────
+            val existing = activeJobs[impulse]
+            if (existing != null && existing.isLive) {
+                val lease = existing.lease(impulseType, needType, impulse)
+                if (!attach || existing.acquire()) return lease
+                return@repeat // torn down in between — retry
             }
-        }
 
-        val resolved = winner
-        if (resolved !== candidate) {
-            candidate.job.cancel() // never started — provider never created
-        }
-        if (resolved == null) {
-            val overflow = MutableSharedFlow<DataState<Need>>(
-                replay = 1,
-                extraBufferCapacity = 0,
-                onBufferOverflow = BufferOverflow.DROP_OLDEST,
+            // ── Resolve factory & verify types ──────────────────────
+            val registered = registry.resolve(impulseType)
+                ?: throw NoProviderException(impulseType)
+            val producedClass = registered.needClass.kotlin.javaObjectType
+            require(needType.javaObjectType.isAssignableFrom(producedClass)) {
+                "Type mismatch for ${impulseType.qualifiedName}: its registered provider produces " +
+                        "${producedClass.name}, but the caller requested ${needType.qualifiedName}. " +
+                        "The requested Need type must be the provider's result type or a super-type of it."
+            }
+
+            // ── Atomic lookup-or-create ─────────────────────────────
+            // The candidate is created LAZY (no dispatch, factory not invoked) so
+            // that losing the race below costs only an allocation. When
+            // attaching, it is born with its collector already registered.
+            val candidate = ActiveJob(
+                impulse, impulseType, producedClass, registered, switchboard,
+                initialSubscribers = if (attach) 1 else 0,
             )
-            overflow.tryEmit(DataState.Error(ProviderConcurrencyException(impulseType, maxConcurrentJobs)))
-            return overflow
+            var winner: ActiveJob? = null
+            activeJobs.compute(impulse) { _, current ->
+                when {
+                    current != null && current.isLive -> {
+                        winner = current
+                        current
+                    }
+                    tryAcquirePermit() -> {
+                        winner = candidate
+                        candidate
+                    }
+                    else -> current // over the limit — leave the table untouched
+                }
+            }
+
+            val resolved = winner
+            if (resolved !== candidate) {
+                candidate.job.cancel() // never started — provider never created
+            }
+            if (resolved == null) {
+                val overflow = MutableSharedFlow<DataState<Need>>(
+                    replay = 1,
+                    extraBufferCapacity = 0,
+                    onBufferOverflow = BufferOverflow.DROP_OLDEST,
+                )
+                overflow.tryEmit(DataState.Error(ProviderConcurrencyException(impulseType, maxConcurrentJobs)))
+                return Lease(null, overflow)
+            }
+            if (resolved === candidate) {
+                // Registered after insertion so the handler can never run inside
+                // the map's bin lock. If the job already completed (parent scope
+                // cancelled), the handler runs immediately.
+                candidate.job.invokeOnCompletion { cause -> candidate.onCompleted(cause) }
+                candidate.job.start()
+                if (!attach) candidate.scheduleIdleCheck()
+                return candidate.lease(impulseType, needType, impulse)
+            }
+            // Deduplicated onto a job that won the race.
+            val lease = resolved.lease(impulseType, needType, impulse)
+            if (!attach || resolved.acquire()) return lease
         }
-        if (resolved === candidate) {
-            // Registered after insertion so the handler can never run inside
-            // the map's bin lock. If the job already completed (parent scope
-            // cancelled), the handler runs immediately.
-            candidate.job.invokeOnCompletion { cause -> candidate.onCompleted(cause) }
-            candidate.job.start()
-            candidate.scheduleIdleCheck()
+        throw IllegalStateException(
+            "Could not attach to a live provider job for $impulse after $MAX_REATTACH_ATTEMPTS attempts; " +
+                    "its jobs kept being torn down before a collector could subscribe."
+        )
+    }
+
+    /** @throws ProviderManagerClosedException if this manager can no longer serve requests. */
+    private fun checkUsable(impulseType: KClass<*>) {
+        if (disposed.get()) {
+            throw ProviderManagerClosedException(
+                this,
+                "ProviderManager has been disposed; cannot process ${impulseType.simpleName}.",
+            )
         }
-        return resolved.view(impulseType, needType, impulse, switchboard)
+        if (!supervisor.isActive) {
+            throw ProviderManagerClosedException(
+                this,
+                "ProviderManager's parent scope has been cancelled; cannot process ${impulseType.simpleName}.",
+            )
+        }
     }
 
     private fun tryAcquirePermit(): Boolean {
@@ -302,6 +415,7 @@ class ProviderManager(
         val needClass: Class<*>,
         registered: ProviderRegistry.RegisteredFactory<*, *>,
         switchboard: SwitchBoard,
+        initialSubscribers: Int,
     ) {
         /**
          * The flow driving [DataState] transitions. `replay = 1` so late
@@ -320,7 +434,8 @@ class ProviderManager(
         }
 
         private val lock = Any()
-        private var subscribers = 0
+        /** Registered collectors; starts at 1 for a job created on a collector's behalf. */
+        private var subscribers = initialSubscribers
 
         /** Bumped on every subscribe / idle-timer schedule; stale timers compare against it. */
         private var idleEpoch = 0L
@@ -445,51 +560,121 @@ class ProviderManager(
         }
 
         /**
-         * Returns a caller-facing view of this job's flow, checked-cast to
-         * [needType] and reference-counted.
+         * Suspends until a collector of this job must stop: the job was torn
+         * down abnormally (idle, [dispose], parent cancellation), or — for a
+         * job that completed normally — this manager was disposed or its
+         * parent scope cancelled. Never returns while the job is running, nor
+         * after normal completion while the manager is alive.
+         */
+        suspend fun awaitTermination() {
+            job.join()
+            if (!job.isCancelled) supervisor.join()
+        }
+
+        /**
+         * Returns a [Lease] on this job whose flow is checked-cast to
+         * [needType]. Does not register a collector.
          *
          * @throws IllegalArgumentException if [needType] is not a super-type
          *         of [needClass].
          */
-        fun <Need : Any, I : DataImpulse<Need>> view(
+        fun <Need : Any, I : DataImpulse<Need>> lease(
             impulseType: KClass<I>,
             needType: KClass<Need>,
             impulse: I,
-            switchboard: SwitchBoard,
-        ): SharedFlow<DataState<Need>> {
+        ): Lease<Need> {
             require(needType.javaObjectType.isAssignableFrom(needClass)) {
                 "Type mismatch for ${impulseType.qualifiedName}: the in-flight provider job for $impulse " +
                         "produces ${needClass.name}, but the caller requested ${needType.qualifiedName}. " +
                         "The requested Need type must be the provider's result type or a super-type of it."
             }
-            return RefCountedFlow(this, TypedDataSharedFlow(sharedFlow, needType)) {
-                request(impulseType, needType, impulse, switchboard)
-            }
+            return Lease(this, TypedDataSharedFlow(sharedFlow, needType))
         }
     }
 
     /**
+     * A typed handle on one job's flow.
+     *
+     * @property entry the job, or `null` for a request the concurrency limit
+     *                 rejected (then [flow] replays the error and is not
+     *                 reference-counted).
+     * @property flow  the typed [DataState] flow to collect.
+     */
+    private class Lease<T : Any>(
+        val entry: ProviderManager.ActiveJob?,
+        val flow: SharedFlow<DataState<T>>,
+    )
+
+    /** Internal signal: the job a collector was attached to has terminated. */
+    private class JobTerminatedSignal : RuntimeException("provider job terminated", null, false, false)
+
+    /**
      * Caller-facing [SharedFlow] that reference-counts its collectors on the
-     * owning [ActiveJob]. If the job has been torn down before collection
-     * starts, collection is transparently redirected to a fresh request.
+     * owning [ActiveJob].
+     *
+     * - If the job has been torn down before collection starts, the collector
+     *   is re-attached to a fresh job — pre-registered, so it cannot be torn
+     *   down again before the collector subscribes ([obtain] with
+     *   `attach = true`). This is a bounded loop, never recursion.
+     * - While collecting, a watcher races the collection against
+     *   [ActiveJob.awaitTermination]. When the job dies abnormally (or the
+     *   manager goes away), the collector re-attaches the same way; once the
+     *   manager is disposed or its scope cancelled, re-attaching throws
+     *   [IllegalStateException], which terminates the collector instead of
+     *   leaving it suspended on a shared flow that will never emit again.
+     *
+     * @param initial  the lease [request] obtained.
+     * @param reAttach obtains a fresh, already-acquired lease for the same
+     *                 impulse; throws [IllegalStateException] when the manager
+     *                 is no longer usable.
      */
     @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
-    private class RefCountedFlow<T : Any>(
-        private val entry: ProviderManager.ActiveJob,
-        private val source: SharedFlow<DataState<T>>,
-        private val reRequest: () -> SharedFlow<DataState<T>>,
+    private inner class RefCountedFlow<T : Any>(
+        private val initial: Lease<T>,
+        private val reAttach: () -> Lease<T>,
     ) : SharedFlow<DataState<T>> {
 
-        override val replayCache: List<DataState<T>> get() = source.replayCache
+        override val replayCache: List<DataState<T>> get() = initial.flow.replayCache
 
         override suspend fun collect(collector: FlowCollector<DataState<T>>): Nothing {
-            if (!entry.acquire()) {
-                reRequest().collect(collector)
+            var lease = initial
+            var attached = lease.entry?.acquire() ?: true
+            var reattachments = 0
+            while (true) {
+                if (attached) {
+                    val entry = lease.entry
+                    try {
+                        collectUntilTerminated(lease, collector)
+                    } finally {
+                        entry?.release()
+                    }
+                }
+                check(++reattachments <= MAX_REATTACH_ATTEMPTS) {
+                    "A collector of ${lease.entry?.key ?: "a provider request"} was detached from its provider " +
+                            "job $MAX_REATTACH_ATTEMPTS times; giving up."
+                }
+                lease = reAttach() // already acquired (or a non-counted overflow lease)
+                attached = true
             }
+        }
+
+        /**
+         * Collects [lease]'s flow until its job terminates (see
+         * [ActiveJob.awaitTermination]), and only then returns normally. A
+         * rejected (overflow) lease terminates only with the manager.
+         */
+        private suspend fun collectUntilTerminated(lease: Lease<T>, collector: FlowCollector<DataState<T>>) {
+            val entry = lease.entry
             try {
-                source.collect(collector)
-            } finally {
-                entry.release()
+                coroutineScope {
+                    launch(start = CoroutineStart.UNDISPATCHED) {
+                        if (entry != null) entry.awaitTermination() else supervisor.join()
+                        throw JobTerminatedSignal()
+                    }
+                    lease.flow.collect(collector)
+                }
+            } catch (signal: JobTerminatedSignal) {
+                // Fall through: the caller re-attaches (or fails if disposed).
             }
         }
     }
@@ -500,9 +685,11 @@ class ProviderManager(
      * Cancels all active provider jobs and idle timers, and clears the job
      * table. Idempotent.
      *
-     * After disposal, [request] throws [IllegalStateException], and collecting
-     * a flow previously returned by [request] whose job was cancelled here
-     * fails the same way instead of hanging.
+     * After disposal, [request] throws [IllegalStateException], and every
+     * collection of a flow previously returned by [request] fails the same
+     * way: collectors that are already running are terminated (they do not
+     * hang), and new collectors fail immediately. See "Termination" in the
+     * class docs.
      *
      * Called when the owning [SwitchBoard] is torn down.
      */
@@ -528,6 +715,14 @@ class ProviderManager(
     companion object {
         /** Default for [idleTimeoutMillis]; matches the SwitchBoard's default stop timeout. */
         const val DEFAULT_IDLE_TIMEOUT_MILLIS: Long = 3_000L
+
+        /**
+         * How many times one collection may be re-attached to a fresh job (or
+         * one lookup retried) before it fails with [IllegalStateException].
+         * In practice a hand-off succeeds on the first re-attach, because the
+         * fresh job is created with its collector already registered.
+         */
+        private const val MAX_REATTACH_ATTEMPTS: Int = 8
     }
 }
 
@@ -546,6 +741,23 @@ class NoProviderException(
     message: String = "No provider registered for impulse type: ${impulseType.simpleName}. " +
             "Annotate a Provider implementation with @SynapseProvider for this impulse type.",
 ) : RuntimeException(message)
+
+/**
+ * The [IllegalStateException] a [ProviderManager] throws once it can no longer
+ * serve requests — after [ProviderManager.dispose] or once its parent scope is
+ * cancelled — both from [ProviderManager.request] and to collectors of the
+ * flows it returned.
+ *
+ * Internal so that the owning [SwitchBoard] can tell "my provider runtime is
+ * gone" apart from any other [IllegalStateException] (for example one thrown
+ * by a downstream collector) and end its request streams normally.
+ *
+ * @property owner the manager that threw it.
+ */
+internal class ProviderManagerClosedException(
+    val owner: ProviderManager,
+    message: String,
+) : IllegalStateException(message)
 
 /**
  * Returned (as [DataState.Error]) when the [ProviderManager]'s concurrency
