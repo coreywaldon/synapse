@@ -281,6 +281,15 @@ Hidden (`DeprecationLevel.HIDDEN`) bridges keep the original JVM signatures of t
 - Stray `}` in the "DataImpulse must be a data class" error message.
 
 **arch**
+- Binary compatibility with libraries compiled against 1.0.x: `CoordinatorScope.getRegistrations()`,
+  `getLifecycleRegistrations()`, `addLifecycleEventRegistration(...)`, `NodeScope.getRegistrations()`,
+  the 1.0.x non-composable `NodeScope.Intercept(point, interceptor, priority)` (now hidden,
+  binary-only) and the `ProviderScope(SwitchBoard, CoroutineScope)` JVM constructor are restored;
+  1.0.x-compiled inline call sites previously failed with `NoSuchMethodError`. Registrations added
+  through the restored list after disposal are unregistered immediately.
+- The composable `NodeScope.Intercept` registers synchronously during composition again, so a
+  `Request` / `ListenFor` / `ReactTo` declared before it in the same `Node` sees the interceptor
+  from its first emission (still once per key, released on leave or abandon).
 - `NoProviderException` told users to annotate with `@Provider`; the annotation is
   `@SynapseProvider`.
 - `NodeScope.Intercept` leaked one interceptor registration per recomposition.
