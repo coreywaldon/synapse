@@ -27,7 +27,7 @@ There are no ViewModels. **Compose** screens use the `Node`/`CreateContext` DSL.
 
 **Learn by doing**
 - [Building a Screen](#-building-a-screen)
-- [Compose DSL](#-compose-dsl) — `CreateContext`, `Node`, `NodeScope`
+- [Compose DSL](#-compose-dsl) — `CreateContext`, `Node`, `NodeScope`, [state persistence](#state-persistence)
 - [Coordinators (Non-Compose)](#-coordinators-non-compose)
 - [Organizing Impulses & State](#-organizing-impulses--state)
 - [Interceptors](#-interceptors)
@@ -428,7 +428,7 @@ Node(initialState = ScreenState()) {
 }
 ```
 
-**State persistence**: If `S` has a `@Serializable` annotation (kotlinx.serialization), state is automatically saved/restored across configuration changes via `rememberSaveable`.
+**Putting it together** — local state, listeners and a request in one Node:
 
 ```kotlin
 Node(initialState = ScreenState()) {
@@ -451,6 +451,50 @@ Node(initialState = ScreenState()) {
     }
 }
 ```
+
+### State persistence
+
+If the state class `S` is `@Serializable` (kotlinx.serialization), `Node` keeps it in `rememberSaveable`, so it survives configuration changes (rotation) and process death. It is saved as a JSON string; a state class that is not `@Serializable` is simply `remember`ed and starts over from `initialState` when the Activity is recreated.
+
+Apply the serialization plugin in the module that declares your state classes:
+
+```kotlin
+plugins {
+    id("org.jetbrains.kotlin.plugin.serialization") version "<your Kotlin version>"
+}
+```
+
+Keep fetched data wrapped in `DataState` — it is `@Serializable` itself, so this works as long as the data type (`Product` here) is `@Serializable` too:
+
+```kotlin
+@Serializable
+data class Product(val id: Int, val name: String)
+
+@Serializable
+data class ProductListState(
+    val products: DataState<List<Product>> = DataState.Idle,
+    val searchQuery: String = "",
+)
+
+Node(initialState = ProductListState()) {
+    Request(impulse = FetchProducts(filter = "popular")) { dataState ->
+        update { it.copy(products = dataState) }
+    }
+    // ...
+}
+```
+
+What comes back after a restore:
+
+| Saved                         | Restored                                                                                     |
+|-------------------------------|----------------------------------------------------------------------------------------------|
+| `Idle` / `Loading`            | The same `DataState.Idle` / `DataState.Loading` singletons                                   |
+| `Success(data)`               | `Success(data)`                                                                              |
+| `Error(cause, staleData)`     | `Error(RestoredDataStateException(originalType, message), staleData)`                        |
+
+A `Throwable` can't be serialized, so an `Error` keeps only its cause's class name and message: the restored `cause` is a `RestoredDataStateException` whose `message` is the original message and whose `originalType` is the original class name (e.g. `"java.io.IOException"`). The original exception's identity, type and stack trace are **not** preserved, so don't branch on `cause is IOException` for restored state. `staleData` is preserved. Either way, the restored value is only what the first frame shows: the `Request` runs again after restoration and re-emits the real state (`Loading`, then `Success` / `Error`).
+
+Every other property of the state class must be serializable too. A property typed as an interface that isn't `@Serializable` compiles fine (the plugin treats it as polymorphic) but throws a `SerializationException` when the state is saved — the crash `DataState` itself caused before 1.1.0.
 
 ---
 
@@ -648,7 +692,7 @@ object Fetch {
 
 ### State design
 
-Keep screen state flat and focused. Use `DataState<T>` for anything loaded from a provider. Use `@Serializable` to survive configuration changes.
+Keep screen state flat and focused. Use `DataState<T>` for anything loaded from a provider. Use `@Serializable` to survive configuration changes and process death — `DataState` is serializable, so keep it wrapped rather than unpacking it into separate fields (see [State persistence](#state-persistence)).
 
 ```kotlin
 @Serializable
@@ -1125,6 +1169,17 @@ Sealed interface wrapping the request lifecycle:
 | `DataState.Error`    | `cause: Throwable`, `staleData: T?` | Request failed — `staleData` holds last success for stale-while-revalidate UI |
 
 Extensions: `dataOrNull` extracts `Success.data` or returns `null`. `isLoading` returns `true` when in `Loading` state.
+
+`DataState` is `@Serializable` through `DataStateSerializer` (in `com.synapselib.core.typed`), so a `@Serializable` class can hold a `DataState<T>` property whenever `T` is serializable. Each variant is a small structure discriminated by `state`:
+
+```json
+{"state":"idle"}
+{"state":"loading"}
+{"state":"success","data":{"id":1,"name":"Lamp"}}
+{"state":"error","message":"timeout","type":"java.io.IOException","staleData":{"id":1,"name":"Lamp"}}
+```
+
+`Idle` and `Loading` decode to the same singletons; an `Error` decodes with a `RestoredDataStateException(originalType, message)` cause and its `staleData` (see [State persistence](#state-persistence)). Outside a `@Serializable` class, construct the serializer directly: `DataStateSerializer(Product.serializer())`.
 
 ### `SwitchBoard` (interface)
 

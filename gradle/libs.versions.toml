@@ -32,6 +32,7 @@ vanniktechPublishPlugin = { module = "com.vanniktech:gradle-maven-publish-plugin
 
 # ── Runtime ──
 kotlinxCoroutinesCore = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+kotlinxSerializationCore = { module = "org.jetbrains.kotlinx:kotlinx-serialization-core", version.ref = "kotlinxSerialization" }
 kotlinxSerializationJson = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
 atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }
 composeRuntime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose" }
@@ -42,7 +43,10 @@ javaxInject = { module = "javax.inject:javax.inject", version.ref = "javaxInject
 hiltCore = { module = "com.google.dagger:hilt-core", version.ref = "dagger" }
 dagger = { module = "com.google.dagger:dagger", version.ref = "dagger" }
 
-# ── Annotation processing ──
+# ── Compiler plugins / annotation processing ──
+# The kotlinx.serialization compiler plugin on its own, for compilations that need it without the
+# Gradle plugin (arch applies it to its test compilation only — see arch/build.gradle.kts).
+kotlinSerializationCompilerPlugin = { module = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version.ref = "kotlin" }
 kspApi = { module = "com.google.devtools.ksp:symbol-processing-api", version.ref = "ksp" }
 daggerCompiler = { module = "com.google.dagger:dagger-compiler", version.ref = "dagger" }
 
@@ -57,4 +61,5 @@ kctforkKsp = { module = "dev.zacsweers.kctfork:ksp", version.ref = "kctfork" }
 
 [plugins]
 kotlinCompose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlinComposePlugin" }
+kotlinSerialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
