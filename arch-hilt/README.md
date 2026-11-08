@@ -30,11 +30,11 @@ Add `arch-hilt` to your **app module** (the module that sets up the Hilt compone
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("com.synapselib:arch-hilt:1.0.13")
+    implementation("com.synapselib:arch-hilt:1.1.0")
 }
 ```
 
-Each **feature module** only needs `arch` and KSP:
+Each **feature module** only needs `arch` plus the KSP processor (`arch-processor`):
 
 ```kotlin
 // feature-xyz/build.gradle.kts
@@ -43,8 +43,8 @@ plugins {
 }
 
 dependencies {
-    implementation("com.synapselib:arch:1.0.13")
-    ksp("com.synapselib:arch:1.0.13")
+    implementation("com.synapselib:arch:1.1.0")
+    ksp("com.synapselib:arch-processor:1.1.0")
 }
 
 ksp {
@@ -53,6 +53,10 @@ ksp {
 ```
 
 That's it. No manual registry wiring — providers are discovered automatically across all modules.
+
+> **Migrating from 1.0.x:** the processor is no longer inside the `arch` artifact. Replace
+> `ksp("com.synapselib:arch:<version>")` with `ksp("com.synapselib:arch-processor:<version>")`
+> in every feature module.
 
 ---
 

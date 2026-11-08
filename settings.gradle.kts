@@ -34,5 +34,6 @@ include(":core")
 include(":arch")
 include(":arch-hilt")
 include(":arch-test")
+include(":arch-processor")
 
 rootProject.name = "Synapse"

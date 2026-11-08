@@ -3,7 +3,6 @@ plugins {
     // Convention plugins are located in `src/main/kotlin`, with the file extension `.gradle.kts`,
     // and are applied in the project's `build.gradle.kts` files as required.
     `kotlin-dsl`
-    id("com.vanniktech.maven.publish") version "0.30.0" apply false
 }
 
 kotlin {
@@ -11,7 +10,8 @@ kotlin {
 }
 
 dependencies {
-    // Add a dependency on the Kotlin Gradle plugin, so that convention plugins can apply it.
+    // Plugins applied by the convention plugins must be on buildSrc's classpath.
+    // Versions come from the shared catalog (gradle/libs.versions.toml).
     implementation(libs.kotlinGradlePlugin)
-    implementation("com.vanniktech:gradle-maven-publish-plugin:0.30.0")
+    implementation(libs.vanniktechPublishPlugin)
 }
