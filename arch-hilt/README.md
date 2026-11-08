@@ -19,7 +19,7 @@ Without this artifact, each Gradle module's KSP-generated code would attempt to 
 
 Each module's generated code contributes a `ProviderRegistryContribution` via `@IntoSet` multibinding. The `SynapseProviderAggregatorModule` collects the full `Set<ProviderRegistryContribution>` and merges them into one `ProviderRegistry`.
 
-If two modules register a provider for the same `DataImpulse` type, the app will fail at startup with a clear error message.
+If two modules register a provider for the same `DataImpulse` type, the app fails at startup with an `IllegalStateException` that names both conflicting provider factories.
 
 ---
 
@@ -64,7 +64,7 @@ That's it. No manual registry wiring — providers are discovered automatically 
 
 ### 1. KSP generates per-module contributions
 
-Each module with `@SynapseProvider` classes generates a Hilt module like:
+When Hilt is on the module's compile classpath, [`arch-processor`](../arch-processor/README.md) generates a Hilt module for each module with `@SynapseProvider` classes, like:
 
 ```kotlin
 @Module
@@ -109,13 +109,24 @@ object SynapseProviderAggregatorModule {
 
 ### 3. The merged registry is injected normally
 
+Inject `ProviderRegistry` wherever you build the board:
+
 ```kotlin
-class DefaultSwitchBoard @Inject constructor(
-    @SwitchBoardScope scope: CoroutineScope,
-    providerRegistry: ProviderRegistry, // <-- the merged registry
-    // ...
-) : SwitchBoard
+@Module
+@InstallIn(SingletonComponent::class)
+object SwitchBoardModule {
+    @Provides @Singleton
+    fun provideSwitchBoard(
+        registry: ProviderRegistry, // <-- the merged registry
+    ): DefaultSwitchBoard = DefaultSwitchBoard(
+        CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        registry,
+        SwitchBoardConfig { maxConcurrentJobs = 8 },
+    )
+}
 ```
+
+`DefaultSwitchBoard` also has an `@Inject` constructor that takes the merged registry. To use it, bind `@SwitchBoardScope CoroutineScope`, `@SwitchBoardWorkerContext CoroutineContext`, `@SwitchBoardStopTimeout Long` and `@SwitchBoardReplayExpiration Long`. Dagger ignores Kotlin default arguments, so all four need a binding.
 
 ---
 
@@ -141,24 +152,29 @@ Both `FetchTokenProvider` and `FetchAddressesProvider` are automatically availab
 
 ## Testing
 
-To replace a specific module's providers in tests:
+To replace a specific module's providers in tests, uninstall its generated module and contribute fakes into the same set:
 
 ```kotlin
 @UninstallModules(SynapseProviderModule_FeatureAuth::class)
 @HiltAndroidTest
 class AuthTest {
-    @BindValue
-    val registry = ProviderRegistry.Builder()
-        .register<AuthToken, FetchToken> { FakeTokenProvider() }
-        .build()
+    @BindValueIntoSet
+    @JvmField
+    val fakeAuthProviders = ProviderRegistryContribution(
+        ProviderRegistry.Builder(name = "fake-auth")
+            .register<AuthToken, FetchToken> { FakeTokenProvider() }
+            .build()
+    )
 }
 ```
+
+To replace the whole registry instead, uninstall `SynapseProviderAggregatorModule::class` as well and `@BindValue` a `ProviderRegistry`. Otherwise Hilt reports a duplicate `ProviderRegistry` binding.
 
 ---
 
 ## Koin
 
-Koin does not have this problem — Koin modules are plain values composed manually in `startKoin`. This artifact is only needed for Hilt projects.
+This artifact is only needed for Hilt projects. Without Hilt, `arch-processor` generates a Koin module per Gradle module (`synapseProviderModule_{ModuleName}`), and you load it in `startKoin`. Note that each generated Koin module declares its own `single<ProviderRegistry>`. There is no Koin aggregator yet, so loading several of them gives you conflicting `ProviderRegistry` definitions, not a merged registry. In a multi-module Koin app, declare the registry yourself, e.g. one `ProviderRegistry.Builder(name = ...)` per feature combined with `ProviderRegistry.of(...)`.
 
 ---
 

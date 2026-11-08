@@ -21,6 +21,7 @@ Synapse Core is one piece of a broader toolkit. If you're building a full applic
 |--------|---------|
 | **[synapse-core](.)** | Reactive operators for Kotlin `Flow` (this library) |
 | **[synapse-arch](arch/)** | Architecture framework — a typed message bus that eliminates cross-feature coordination. No ViewModels, no ad-hoc event buses. |
+| **[synapse-arch-processor](arch-processor/)** | KSP processor for `@SynapseProvider` — generates the Hilt / Koin provider registry (`ksp(...)` only) |
 | **[synapse-arch-hilt](arch-hilt/)** | Hilt integration for multi-module Synapse Arch projects |
 | **[synapse-arch-test](arch-test/)** | Test utilities for Synapse Arch — `SynapseTestRule` + interceptor-based capture helpers |
 
@@ -44,6 +45,8 @@ dependencies {
 }
 ```
 
+See the [CHANGELOG](CHANGELOG.md) for what changed in each release.
+
 ## ⚡ Quick Start
 
 You can wrap any existing `Flow` using `.asReactive()` or use the provided extension functions directly.
@@ -64,7 +67,7 @@ analyticsEvents
 
 Synapse treats `StateFlow<Boolean>` as a first-class citizen. You can combine multiple state flows using standard infix logic gates without the boilerplate of `combine`.
 
-**Available Operators:** `and`, `or`, `xor`, `nand`, `nor`, `xnor`, `imp`, `nimp`, `not`.
+**Available Operators:** `and`, `or`, `xor`, `nand`, `nor`, `xnor`, `imp`, `nimp`, `not` (also usable as the prefix `!`).
 
 ```kotlin
 val isFormValid: StateFlow<Boolean> = ...
@@ -72,8 +75,10 @@ val isNetworkAvailable: StateFlow<Boolean> = ...
 val isSubmitting: StateFlow<Boolean> = ...
 
 // Combine states declaratively
-val canSubmit = (isFormValid and isNetworkAvailable) and isSubmitting.not()
+val canSubmit = (isFormValid and isNetworkAvailable) and !isSubmitting
 ```
+
+Derived flows compute `.value` synchronously and, like any `StateFlow`, never emit two equal values in a row.
 
 ## 📚 Core Operators
 
@@ -109,6 +114,10 @@ analyticsFlow.gate(isNetworkAvailable, GateStrategy.BUFFER)
 ```
 </details>
 
+The condition can be a `StateFlow<Boolean>` or any `Flow<Boolean>`. The gate starts **closed** until the condition emits its first value. `bufferCapacity` (default unbounded, must be positive) caps the `BUFFER` queue by dropping the oldest items.
+
+**Completion:** the gated flow completes normally once the upstream has completed *and* nothing it holds is still waiting for the gate to open. That means an empty buffer for `BUFFER`, no stored value for `LATEST`, and immediately for `DROP`. Upstream errors propagate immediately, even while the gate is closed.
+
 ---
 
 ### `squash`
@@ -123,6 +132,8 @@ buttonClicks
     .squash(retentionPeriod = 500.milliseconds)
     .collect { handleClick() }
 ```
+
+Optional parameters: `maxDistinctValues` (default 100; the oldest tracked value is evicted when full), `shouldSquash` (values for which it returns `false` always pass), and `timeSource` (see [Testing time-based operators](#-testing-time-based-operators)).
 
 ---
 
@@ -139,6 +150,8 @@ renderRequests
     .collect { renderFrame(it) }
 ```
 
+The first item is emitted immediately. The gap is measured from when the previous emission returned.
+
 ---
 
 ### `combo`
@@ -150,8 +163,18 @@ Detects specific sequences of values emitted within a defined time window. It ut
 val konamiCode = listOf(UP, UP, DOWN, DOWN, LEFT, RIGHT, LEFT, RIGHT, B, A)
 
 inputEvents
-    .combo(sequences = listOf(konamiCode), timeout = 2.seconds)
+    .combo(sequences = listOf(konamiCode), interval = 2.seconds)
     .collect { println("Cheat Code Activated!") }
+```
+
+`interval` is the maximum gap between two inputs; a longer pause resets the detection. (The equivalent parameter of the `ReactiveFlow.combo` member is named `timeout`.) Empty sequences are ignored.
+
+**Greedy matching** (`greedy = true`): when a match is a prefix of a longer target (e.g. `[A, B]` and `[A, B, C]`), the short match is *held* while input keeps following the longer path. If the longer sequence completes, only it is emitted. Otherwise the held match is emitted as soon as an input breaks the chain, when no input arrives within `interval` of the last step, or when the upstream completes. The breaking input can itself start a new combo.
+
+```kotlin
+inputEvents
+    .combo(sequences = listOf(listOf(A, B), listOf(A, B, C)), interval = 300.milliseconds, greedy = true)
+    .collect { match -> println("Matched $match") } // A, B, C → [A, B, C] only; A, B, X → [A, B]
 ```
 
 ---
@@ -170,6 +193,8 @@ logFlow
     }
 ```
 
+Empty chunks are never emitted, and `period` must be positive. When the upstream completes, the remaining partial chunk is emitted. When it fails, the partial chunk is dropped and the error is rethrown.
+
 ---
 
 ### `shutter`
@@ -183,6 +208,46 @@ sensorReadings
     .shutter(trigger = measureButtonClick)
     .collect { recordMeasurement(it) }
 ```
+
+Triggers that arrive before the upstream's first value are ignored, and every trigger samples, so the same value can be emitted repeatedly.
+
+**Completion:** the sampled flow completes when the **trigger** completes, and the upstream collection is then cancelled. Upstream completion does *not* end it: the last value stays available to later triggers. An error from either side fails the flow.
+
+---
+
+### `resilient`
+**Retry with Exponential Backoff**
+
+Re-collects the upstream when it fails, waiting `initialDelay * factor^attempt` before each retry (attempt starts at 0). Fractional factors are applied exactly, and the delay saturates instead of overflowing. Cancellation is never retried, and after `maxRetries` the error propagates.
+
+```kotlin
+api.observePrices()
+    .resilient(maxRetries = 5, initialDelay = 200.milliseconds, factor = 1.5) // 200ms, 300ms, 450ms, …
+    .collect { render(it) }
+```
+
+> The `Flow.resilient` extension defaults `initialDelay` to `Duration.ZERO` (immediate retries). The `ReactiveFlow.resilient` member defaults to 100 ms.
+
+---
+
+## ⏱️ Testing time-based operators
+
+`squash`, `pace` and `combo` read the current time from a `kotlin.time.TimeSource`. They wait with coroutine `delay`, so the two must agree. Production code uses `TimeSource.Monotonic` (the default). Under `kotlinx-coroutines-test`, pass the test scheduler's virtual clock:
+
+```kotlin
+@Test
+fun pacesEvents() = runTest {
+    val paced = events.pace(100.milliseconds, testTimeSource).toList()
+    // ...
+}
+
+// Or wrap once: every chained ReactiveFlow operator keeps the same time source.
+events.asReactive(testTimeSource)
+    .squash(500.milliseconds)
+    .pace(100.milliseconds)
+```
+
+The `() -> Long` nanosecond-clock overloads of `ReactiveFlow(...)`, `squash`, `pace` and `combo` are deprecated in favor of `TimeSource`.
 
 ## 🤝 Contributing
 

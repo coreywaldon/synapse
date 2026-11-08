@@ -11,6 +11,9 @@ generates a DI module that registers all of that module's providers in a `Provid
   [`arch-hilt`](../arch-hilt/README.md).
 - **Koin** (otherwise, when Koin is on the classpath): a `synapseProviderModule_{ModuleName}` Koin module.
 
+Generated code lives in the `com.synapselib.arch.generated` package. If neither Hilt nor Koin is on the
+classpath, the processor reports an error.
+
 The processor is a compile-only artifact: it is only ever added to the `ksp` configuration, so
 nothing from it (or from KSP) reaches your app's runtime classpath.
 
@@ -50,6 +53,10 @@ The processor fails the build when a `@SynapseProvider` class:
 
 and it reports an error when the `DataImpulse` is not a `data class`. It warns when a provider has
 no `@Inject` constructor.
+
+Duplicates are detected per Gradle module at compile time. Duplicates *across* modules are detected
+at app startup, when `arch-hilt`'s aggregator merges the contributions; the `IllegalStateException`
+names both provider factories.
 
 ## 📄 License
 
