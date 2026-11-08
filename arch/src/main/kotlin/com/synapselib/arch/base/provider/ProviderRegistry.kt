@@ -2,7 +2,6 @@ package com.synapselib.arch.base.provider
 
 import com.synapselib.arch.base.DataImpulse
 import kotlinx.coroutines.flow.Flow
-import kotlin.collections.iterator
 import kotlin.reflect.KClass
 
 /**
@@ -46,13 +45,30 @@ import kotlin.reflect.KClass
  * val switchboard = DefaultSwitchBoard(scope, registry)
  * ```
  *
+ * ## Composition
+ *
+ * Registries compose with [plus] / [of] (or [Builder.mergeFrom]). Duplicate
+ * impulse types are rejected; the error names both conflicting registrations
+ * — including the [name] of the registry each came from, when one was given
+ * to its [Builder]:
+ *
+ * ```kotlin
+ * val registry = ProviderRegistry.of(userRegistry, cartRegistry)
+ * val alsoRegistry = userRegistry + cartRegistry
+ * ```
+ *
  * ## Thread Safety
  *
  * Once [build] is called, the resulting [ProviderRegistry] is effectively
- * immutable. All reads are lock-free concurrent map lookups.
+ * immutable. All reads are lock-free map lookups.
+ *
+ * @property name optional human-readable origin of this registry (e.g. the
+ *                Gradle module that contributed it). Used only in
+ *                diagnostics.
  */
 class ProviderRegistry private constructor(
     private val factories: Map<KClass<*>, RegisteredFactory<*, *>>,
+    val name: String?,
 ) {
 
     /**
@@ -66,18 +82,16 @@ class ProviderRegistry private constructor(
      * @property impulseClass the [Class] token for [I].
      * @property needClass    the [Class] token for [Need].
      * @property factory      the underlying [ProviderFactory].
+     * @property origin       the [name] of the registry this factory was
+     *                        first registered in, if any. Preserved across
+     *                        merges for duplicate diagnostics.
      */
     internal class RegisteredFactory<I : DataImpulse<Need>, Need : Any>(
         val impulseClass: Class<I>,
         val needClass: Class<Need>,
         val factory: ProviderFactory<I, Need>,
+        val origin: String?,
     ) {
-        /** Casts an untyped impulse to [I] via [Class.cast]. */
-        fun castImpulse(impulse: Any): I = impulseClass.cast(impulse)
-
-        /** Creates a new [Provider] instance. */
-        fun createProvider(): Provider<I, Need> = factory.create()
-
         /**
          * Instantiates the [Provider] and invokes [Provider.produce] with
          * a checked-cast impulse, returning the flow widened to `Flow<Any>`.
@@ -99,6 +113,12 @@ class ProviderRegistry private constructor(
             val provider: Provider<I, Need> = factory.create()
             // Flow<Need> widens to Flow<Any> — safe covariant collection.
             return with(provider) { providerScope.produce(typedImpulse) }
+        }
+
+        /** Human-readable description for diagnostics: factory class plus origin. */
+        fun describe(): String {
+            val where = origin?.let { " from registry '$it'" } ?: " from an unnamed registry"
+            return "${factory.javaClass.name}$where"
         }
     }
 
@@ -122,12 +142,26 @@ class ProviderRegistry private constructor(
     fun hasProvider(impulseType: KClass<*>): Boolean =
         factories.containsKey(impulseType)
 
-    /** Returns the set of all registered [DataImpulse] types. */
+    /** Returns a snapshot of the set of all registered [DataImpulse] types. */
     fun registeredImpulseTypes(): Set<KClass<*>> =
         factories.keys.toSet()
 
     /** Returns the total number of registered providers. */
     val size: Int get() = factories.size
+
+    /**
+     * Returns a new registry containing the registrations of both `this` and
+     * [other].
+     *
+     * @throws IllegalStateException if both registries register the same
+     *         impulse type. The message names both registrations.
+     */
+    operator fun plus(other: ProviderRegistry): ProviderRegistry =
+        Builder().mergeFrom(this).mergeFrom(other).build()
+
+    override fun toString(): String =
+        "ProviderRegistry(${name?.let { "name=$it, " } ?: ""}" +
+                "impulses=${factories.keys.map { it.simpleName }})"
 
     // ── Builder ─────────────────────────────────────────────────────────
 
@@ -145,8 +179,13 @@ class ProviderRegistry private constructor(
      *     }
      *     .build()
      * ```
+     *
+     * @param name optional origin label (e.g. the contributing Gradle module)
+     *             stamped on the built registry and on every factory
+     *             registered directly through this builder. Appears in
+     *             duplicate-registration errors.
      */
-    class Builder {
+    class Builder(private val name: String? = null) {
 
         private val factories = mutableMapOf<KClass<*>, RegisteredFactory<*, *>>()
 
@@ -167,16 +206,13 @@ class ProviderRegistry private constructor(
             needClass: Class<Need>,
             factory: ProviderFactory<I, Need>,
         ): Builder {
-            check(!factories.containsKey(impulseType)) {
-                "Duplicate provider registration for impulse type: " +
-                        "${impulseType.simpleName}. Each DataImpulse type must " +
-                        "have exactly one provider."
-            }
-            factories[impulseType] = RegisteredFactory(
+            val incoming = RegisteredFactory(
                 impulseClass = impulseType.java,
                 needClass = needClass,
                 factory = factory,
+                origin = name,
             )
+            put(impulseType, incoming, context = "registration")
             return this
         }
 
@@ -218,18 +254,28 @@ class ProviderRegistry private constructor(
          *     .build()
          * ```
          *
+         * Merged factories keep the origin of the registry they were first
+         * registered in.
+         *
          * @throws IllegalStateException if any impulse type in [other]
-         *         is already registered in this builder.
+         *         is already registered in this builder. The message names
+         *         both conflicting registrations.
          */
         fun mergeFrom(other: ProviderRegistry): Builder {
             for ((key, factory) in other.factories) {
-                check(!factories.containsKey(key)) {
-                    "Duplicate provider registration during merge for impulse " +
-                            "type: ${key.simpleName}"
-                }
-                factories[key] = factory
+                put(key, factory, context = "merge")
             }
             return this
+        }
+
+        private fun put(impulseType: KClass<*>, incoming: RegisteredFactory<*, *>, context: String) {
+            val existing = factories[impulseType]
+            check(existing == null) {
+                "Duplicate provider $context for impulse type ${impulseType.qualifiedName ?: impulseType}: " +
+                        "already registered by ${existing!!.describe()}; conflicting registration by " +
+                        "${incoming.describe()}. Each DataImpulse type must have exactly one provider."
+            }
+            factories[impulseType] = incoming
         }
 
         /**
@@ -238,11 +284,27 @@ class ProviderRegistry private constructor(
          *
          * @return the finalized registry.
          */
-        fun build(): ProviderRegistry = ProviderRegistry(factories.toMap())
+        fun build(): ProviderRegistry = ProviderRegistry(factories.toMap(), name)
     }
 
     companion object {
         /** An empty registry with no providers. Useful as a default in tests. */
-        val EMPTY = ProviderRegistry(emptyMap())
+        val EMPTY: ProviderRegistry = ProviderRegistry(emptyMap(), name = null)
+
+        /**
+         * Composes [registries] into one.
+         *
+         * ```kotlin
+         * val registry = ProviderRegistry.of(userRegistry, cartRegistry)
+         * ```
+         *
+         * @throws IllegalStateException if two registries register the same
+         *         impulse type. The message names both registrations.
+         */
+        fun of(vararg registries: ProviderRegistry): ProviderRegistry {
+            val builder = Builder()
+            registries.forEach { builder.mergeFrom(it) }
+            return builder.build()
+        }
     }
 }
