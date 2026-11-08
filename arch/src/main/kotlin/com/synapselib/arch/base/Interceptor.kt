@@ -2,8 +2,8 @@ package com.synapselib.arch.base
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentSkipListSet
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.jvm.java
 import kotlin.reflect.KClass
 
 /**
@@ -145,7 +145,10 @@ fun interface Interceptor<T> {
  * A handle returned when registering an interceptor, allowing the caller to
  * later remove it from the registry.
  *
- * Calling [unregister] is idempotent — subsequent calls are safe no-ops.
+ * Handles returned by the library ([InterceptorRegistry.add],
+ * [SwitchBoard.addInterceptor], [SwitchBoard.addObserver], …) are
+ * idempotent: calling [unregister] more than once is a safe no-op. Custom
+ * implementations should follow the same contract.
  */
 fun interface Registration {
 
@@ -204,15 +207,25 @@ suspend inline fun <reified T : Any> InterceptorPipeline.applyInterceptors(data:
  *
  * Interceptors are grouped by their target [KClass] and executed in
  * **ascending priority** order (lowest value runs first). Interceptors with
- * equal priority are executed in **FIFO insertion order**.
+ * equal priority are executed in **FIFO insertion order**. An interceptor
+ * registered for a supertype (e.g. `Any::class` or a sealed parent) also
+ * applies to all of its subtypes, merged into the same priority order.
+ *
+ * ## Performance
+ *
+ * The resolved pipeline for each target type is cached together with its
+ * pre-built, immutable chain links, so steady-state [applyInterceptors] calls
+ * perform one map lookup and allocate no chain objects. The cache is
+ * invalidated by a version stamp that only advances on effective
+ * registrations and removals.
  *
  * ## Thread Safety
  *
  * All public methods are safe to call from any thread or coroutine.
  * Registration and un-registration may happen concurrently with pipeline
  * execution. Note, however, that an in-flight [applyInterceptors] call sees a
- * snapshot of the interceptor set at the moment it builds the chain; changes
- * that occur *during* execution will only be visible to subsequent calls.
+ * snapshot of the interceptor set taken when the call starts; changes that
+ * occur *during* execution will only be visible to subsequent calls.
  *
  * ## Usage
  *
@@ -243,7 +256,9 @@ class InterceptorRegistry : InterceptorPipeline {
      * @property priority       numeric priority; lower values execute first.
      * @property insertionOrder globally unique, monotonically increasing counter
      *                          used to break priority ties in FIFO order.
-     * @property javaClass      the [Class] token for runtime type checking/casting.
+     * @property javaClass      the **boxed** [Class] token for runtime type
+     *                          checking/casting ([KClass.javaObjectType], so that
+     *                          primitive types such as `Int` work).
      * @property interceptor    the underlying [Interceptor] instance.
      */
     private class Entry<T : Any>(
@@ -253,20 +268,49 @@ class InterceptorRegistry : InterceptorPipeline {
         val interceptor: Interceptor<T>,
     ) {
         /**
-         * Invokes this entry's [interceptor] with an untyped [data] value and
-         * [chain], performing safe checked casts on both the input and the
-         * downstream chain's return value.
+         * Invokes this entry's [interceptor] with an untyped [data] value,
+         * performing a checked cast on the input. [next] is the pre-built
+         * link for the remainder of the pipeline; it checked-casts the
+         * downstream result back to [T] itself.
          *
-         * @param data  the raw data value (erased to [Any]).
-         * @param chain the downstream chain handle (erased to `Chain<Any>`).
-         * @return the result of this interceptor, cast back to [Any].
-         * @throws ClassCastException if [data] or a downstream result is not
-         *         assignable to [T].
+         * @throws ClassCastException if [data] is not assignable to [T].
          */
-        suspend fun interceptUntyped(data: Any, chain: Interceptor.Chain<Any>): Any {
-            val typed: T = javaClass.cast(data)
-            val typedChain = Interceptor.Chain<T> { modified -> javaClass.cast(chain.proceed(modified)) }
-            return interceptor.intercept(typed, typedChain)
+        suspend fun interceptUntyped(data: Any, next: Link<*>): Any {
+            @Suppress("UNCHECKED_CAST") // `next` was built by linkTo(), so its result class is javaClass
+            val typedNext = next as Link<T>
+            return interceptor.intercept(javaClass.cast(data), typedNext)
+        }
+
+        /** Creates the link handed to this entry: it resumes the pipeline at [nextIndex]. */
+        fun linkTo(entries: Array<Entry<*>>, nextIndex: Int, next: Link<*>?): Link<T> =
+            Link(entries, nextIndex, javaClass, next)
+    }
+
+    /**
+     * Index-based chain link over an immutable snapshot array, in the style of
+     * OkHttp's `RealInterceptorChain`.
+     *
+     * A link is fully described by the snapshot [entries], the [index] of the
+     * entry it runs next, and the [resultClass] its holder expects back. Since
+     * that is all immutable, the `entries.size + 1` links of a snapshot are
+     * **pre-built once** when the snapshot is resolved: executing the pipeline
+     * allocates no chain objects at all, and calling [proceed] several times
+     * (retry) or not at all (short-circuit) is naturally supported.
+     *
+     * @param T the data type expected by the interceptor that holds this link.
+     * @property next the link for `index + 1`, or `null` for the terminal link.
+     */
+    private class Link<T : Any>(
+        private val entries: Array<Entry<*>>,
+        private val index: Int,
+        private val resultClass: Class<T>,
+        private val next: Link<*>?,
+    ) : Interceptor.Chain<T> {
+
+        override suspend fun proceed(data: T): T {
+            // Terminal link: identity.
+            if (index == entries.size) return resultClass.cast(data)
+            return resultClass.cast(entries[index].interceptUntyped(data, next!!))
         }
     }
 
@@ -287,11 +331,14 @@ class InterceptorRegistry : InterceptorPipeline {
     private val insertionCounter = AtomicLong(0)
 
     /**
-     * Global version stamp, incremented on every add/remove. Used to cheaply
-     * detect whether the [resolvedCache] entries are still valid without
-     * clearing the entire cache or taking a lock.
+     * Global version stamp, incremented on every *effective* add/remove. Used
+     * to cheaply detect whether the [resolvedCache] entries are still valid
+     * without clearing the entire cache or taking a lock.
      */
     private val version = AtomicLong(0)
+
+    /** Current [version] stamp; exposed for tests and diagnostics only. */
+    internal val currentVersion: Long get() = version.get()
 
     /**
      * The primary data structure: a map from data type ([KClass]) to a sorted
@@ -303,29 +350,56 @@ class InterceptorRegistry : InterceptorPipeline {
     private val map = ConcurrentHashMap<KClass<*>, ConcurrentSkipListSet<Entry<*>>>()
 
     /**
-     * Cached, pre-resolved interceptor arrays keyed by target [KClass].
+     * Cached, pre-resolved pipelines keyed by target [KClass].
      *
-     * Each value is a [VersionedSnapshot]: the [version] at which it was
-     * computed, plus the flattened, sorted [Array] of [Entry] objects that
-     * matched the key type via [Class.isAssignableFrom]. On a cache hit with
-     * a matching version the hot path is a single map lookup + long comparison.
+     * Each value is a [Snapshot]: the [version] at which it was computed and
+     * the head of the pre-built chain over the flattened, sorted entries that
+     * matched the key type via [Class.isAssignableFrom]. On a cache hit with a
+     * matching version the hot path is a single map lookup + long comparison,
+     * with no allocation.
      *
      * Entries become stale (but never incorrect) when [version] advances;
      * stale entries are lazily recomputed on the next access.
      */
-    private val resolvedCache = ConcurrentHashMap<KClass<*>, VersionedSnapshot>()
+    private val resolvedCache = ConcurrentHashMap<KClass<*>, Snapshot>()
 
     /**
-     * A snapshot of resolved entries tagged with the [version] at which it
+     * An immutable, resolved pipeline tagged with the [version] at which it
      * was computed.
+     *
+     * @property snapshotVersion the registry version this snapshot reflects.
+     * @property head            the first chain link, or `null` when no
+     *                           interceptor applies (identity pipeline).
      */
-    private class VersionedSnapshot(
+    private class Snapshot(
         val snapshotVersion: Long,
-        val entries: Array<Entry<*>>,
+        val head: Link<*>?,
     )
 
     /**
+     * [Registration] handle for one entry. [unregister] is truly idempotent:
+     * only the first call removes the entry and advances [version]; later
+     * calls neither touch the set nor invalidate the resolved caches.
+     */
+    private inner class EntryRegistration(
+        private val set: ConcurrentSkipListSet<Entry<*>>,
+        private val entry: Entry<*>,
+    ) : Registration {
+        private val active = AtomicBoolean(true)
+
+        override fun unregister() {
+            if (active.compareAndSet(true, false)) {
+                set.remove(entry)
+                version.incrementAndGet()
+            }
+        }
+    }
+
+    /**
      * Registers an [interceptor] for the given data type [clazz].
+     *
+     * The interceptor also applies to every **subtype** of [clazz] (e.g. an
+     * interceptor registered for `Any::class` sees every value).
      *
      * Lower [priority] values execute first. Interceptors with the same
      * priority run in the order they were registered (FIFO).
@@ -335,7 +409,8 @@ class InterceptorRegistry : InterceptorPipeline {
      * @param interceptor the interceptor to register.
      * @param priority    execution priority; lower values run first. Defaults to `0`.
      * @return a [Registration] handle — call [Registration.unregister] to remove
-     *         the interceptor from future pipeline executions.
+     *         the interceptor from future pipeline executions. Unregistering is
+     *         idempotent.
      */
     fun <T : Any> add(
         clazz: KClass<T>,
@@ -343,13 +418,10 @@ class InterceptorRegistry : InterceptorPipeline {
         priority: Int = 0,
     ): Registration {
         val set = map.getOrPut(clazz) { ConcurrentSkipListSet(entryComparator) }
-        val entry = Entry(priority, insertionCounter.getAndIncrement(), clazz.java, interceptor)
+        val entry = Entry(priority, insertionCounter.getAndIncrement(), clazz.javaObjectType, interceptor)
         set.add(entry)
         version.incrementAndGet()
-        return Registration {
-            set.remove(entry)
-            version.incrementAndGet()
-        }
+        return EntryRegistration(set, entry)
     }
 
     /**
@@ -368,31 +440,32 @@ class InterceptorRegistry : InterceptorPipeline {
     ): Registration = add(T::class, interceptor, priority)
 
     /**
-     * Returns the resolved, sorted array of [Entry] objects applicable to
-     * [clazz]. Results are cached and only recomputed when the global
-     * [version] has advanced since the last snapshot.
+     * Returns the resolved [Snapshot] applicable to [clazz]. Results are
+     * cached and only recomputed when the global [version] has advanced since
+     * the last snapshot.
      *
      * @param clazz the target data type.
-     * @return a (possibly shared) array of entries in execution order.
+     * @return a (possibly shared) immutable snapshot.
      */
-    private fun resolveEntries(clazz: KClass<*>): Array<Entry<*>> {
+    private fun resolve(clazz: KClass<*>): Snapshot {
         val currentVersion = version.get()
 
         // Fast path: cache hit with current version — no allocation at all.
         val cached = resolvedCache[clazz]
         if (cached != null && cached.snapshotVersion == currentVersion) {
-            return cached.entries
+            return cached
         }
 
         // Slow path: recompute. Multiple threads may race here; that's fine —
-        // they'll produce identical results and the last write wins harmlessly.
-        val targetJavaClass = clazz.java
+        // they'll produce equivalent results and the last write wins harmlessly
+        // (a snapshot tagged with an outdated version is simply recomputed).
+        val targetJavaClass = clazz.javaObjectType
 
         // Single-pass collection: iterate map entries, accumulate matching
         // entries into a mutable list, then sort once.
         val result = ArrayList<Entry<*>>()
         for ((key, set) in map) {
-            if (key.java.isAssignableFrom(targetJavaClass)) {
+            if (key.javaObjectType.isAssignableFrom(targetJavaClass)) {
                 // ConcurrentSkipListSet iteration is weakly-consistent and
                 // already in comparator order, but entries from *different*
                 // sets must be merged, so we still need a final sort.
@@ -400,27 +473,44 @@ class InterceptorRegistry : InterceptorPipeline {
             }
         }
 
-        val entries = if (result.isEmpty()) {
-            emptyArray<Entry<*>>()
+        val snapshot = if (result.isEmpty()) {
+            Snapshot(currentVersion, head = null)
         } else {
             result.sortWith(entryComparator)
-            result.toTypedArray()
+            Snapshot(currentVersion, head = buildChain(result.toTypedArray(), targetJavaClass))
         }
 
-        resolvedCache[clazz] = VersionedSnapshot(currentVersion, entries)
-        return entries
+        resolvedCache[clazz] = snapshot
+        return snapshot
+    }
+
+    /**
+     * Pre-builds the `entries.size + 1` immutable links over [entries], from
+     * the terminal (identity) link back to the head. Link `i` is held by
+     * `entries[i - 1]` (or by the caller, for the head) and casts its result to
+     * that holder's type.
+     *
+     * @return the head link.
+     */
+    private fun buildChain(entries: Array<Entry<*>>, targetJavaClass: Class<*>): Link<*> {
+        var next: Link<*>? = null
+        for (i in entries.size downTo 1) {
+            next = entries[i - 1].linkTo(entries, i, next)
+        }
+        return Link(entries, 0, targetJavaClass, next)
     }
 
     /**
      * Runs all registered interceptors for [clazz] in priority order
      * (lowest first), threading [data] through the chain.
      *
-     * The chain is constructed from tail to head so that the highest-priority
-     * (lowest-numbered) interceptor executes first and the identity function
-     * serves as the terminal handler.
+     * The chain links are pre-built per snapshot, so a call allocates no chain
+     * objects. The snapshot is captured once at the start of the call:
+     * registrations or removals that happen *during* execution only affect
+     * subsequent calls.
      *
      * If no interceptors are registered for the given type, [data] is returned
-     * unchanged with no allocations beyond the map lookup.
+     * unchanged.
      *
      * @param T     the data type.
      * @param clazz the [KClass] token used to look up interceptors.
@@ -430,19 +520,9 @@ class InterceptorRegistry : InterceptorPipeline {
      *         assignable to [T].
      */
     override suspend fun <T : Any> applyInterceptors(clazz: KClass<out T>, data: T): T {
-        val entries = resolveEntries(clazz)
-        if (entries.isEmpty()) return data
-
-        // Build the chain iteratively from tail to head. Each link is a single
-        // lambda capturing only the entry and the next chain reference
-        var chain: Interceptor.Chain<Any> = Interceptor.Chain { it }
-        for (i in entries.indices.reversed()) {
-            val entry = entries[i]
-            val next = chain
-            chain = Interceptor.Chain { d -> entry.interceptUntyped(d, next) }
-        }
-
-        val result = chain.proceed(data)
-        return clazz.java.cast(result)
+        val head = resolve(clazz).head ?: return data
+        @Suppress("UNCHECKED_CAST") // the head link's result class is clazz.javaObjectType
+        val typedHead = head as Link<Any>
+        return clazz.javaObjectType.cast(typedHead.proceed(data))
     }
 }

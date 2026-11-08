@@ -1843,4 +1843,90 @@ class DefaultSwitchBoardTest {
         assertEquals(1, traces.size)
         assertEquals("ReactEmitter", traces[0])
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // InterceptPoint lookup
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `InterceptPoint of returns the pre-allocated constants`() {
+        for (channel in Channel.entries) {
+            for (direction in Direction.entries) {
+                val point = InterceptPoint.of(channel, direction)
+                assertEquals(InterceptPoint(channel, direction), point)
+                assertTrue(point === InterceptPoint.of(channel, direction))
+            }
+        }
+        assertTrue(InterceptPoint.of(Channel.STATE, Direction.UPSTREAM) === InterceptPoint.STATE_UPSTREAM)
+        assertTrue(InterceptPoint.of(Channel.REQUEST, Direction.DOWNSTREAM) === InterceptPoint.REQUEST_DOWNSTREAM)
+        assertTrue(InterceptPoint.of(Channel.REACTION, Direction.DOWNSTREAM) === InterceptPoint.REACTION_DOWNSTREAM)
+    }
+
+    @Test
+    fun `InterceptPoint ALL lists all six distinct constants`() {
+        assertEquals(6, InterceptPoint.ALL.size)
+        assertEquals(6, InterceptPoint.ALL.toSet().size)
+        InterceptPoint.ALL.forEach { point ->
+            assertTrue(point === InterceptPoint.of(point.channel, point.direction))
+        }
+    }
+
+    @Test
+    fun `manually constructed InterceptPoint targets the same registry as the constant`() = runTest(UnconfinedTestDispatcher()) {
+        val board = emptyBoard(CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob()))
+        board.addInterceptor(
+            InterceptPoint(Channel.STATE, Direction.UPSTREAM),
+            Interceptor.transform<UserState> { it.copy(age = 99) },
+        )
+        board.broadcastState(UserState::class, UserState("x"))
+        assertEquals(listOf<Any>(UserState("x", 99)), board.getRawStateFlow(UserState::class).replayCache)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Logging interceptors
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `addLoggingInterceptors logs every stage and unregisters all at once`() = runTest(UnconfinedTestDispatcher()) {
+        val board = emptyBoard(CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob()))
+        val logged = CopyOnWriteArrayList<UserState>()
+        val registration = board.addLoggingInterceptors<UserState> { logged.add(it) }
+
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) {
+            board.stateFlow(UserState::class).collect { }
+        }
+        board.broadcastState(UserState::class, UserState("a"))
+        advanceUntilIdle()
+        assertEquals(2, logged.size, "upstream + downstream")
+
+        registration.unregister()
+        board.broadcastState(UserState::class, UserState("b"))
+        advanceUntilIdle()
+        assertEquals(2, logged.size)
+        job.cancel()
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Primitive / boxed types
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `state and reaction channels support primitive Kotlin types`() = runTest(UnconfinedTestDispatcher()) {
+        val board = emptyBoard(CoroutineScope(UnconfinedTestDispatcher(testScheduler) + SupervisorJob()))
+        board.addInterceptor(InterceptPoint.STATE_DOWNSTREAM, Interceptor.transform<Int> { it + 1 })
+        val states = CopyOnWriteArrayList<Int>()
+        val reactions = CopyOnWriteArrayList<Long>()
+
+        val jobs = listOf(
+            launch(UnconfinedTestDispatcher(testScheduler)) { board.stateFlow(Int::class).collect { states.add(it) } },
+            launch(UnconfinedTestDispatcher(testScheduler)) { board.impulseFlow(Long::class).collect { reactions.add(it) } },
+        )
+        board.broadcastState(Int::class, 41)
+        board.triggerImpulse(Long::class, 7L)
+        advanceUntilIdle()
+
+        assertEquals(listOf(42), states)
+        assertEquals(listOf(7L), reactions)
+        jobs.forEach { it.cancel() }
+    }
 }

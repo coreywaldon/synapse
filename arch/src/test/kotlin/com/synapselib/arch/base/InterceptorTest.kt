@@ -384,4 +384,137 @@ class InterceptorTest {
         val pipeline: InterceptorPipeline = registry
         assertNotNull(pipeline)
     }
+
+    // ── Registration idempotency ─────────────────────────────────────────
+
+    @Test
+    fun `repeated unregister does not invalidate the resolved cache again`() = runTest {
+        val reg = registry.add(Interceptor.read<Request> { })
+        val afterAdd = registry.currentVersion
+
+        reg.unregister()
+        val afterFirstUnregister = registry.currentVersion
+        reg.unregister()
+        reg.unregister()
+
+        assertEquals(afterAdd + 1, afterFirstUnregister)
+        assertEquals(afterFirstUnregister, registry.currentVersion, "extra unregister() calls must be no-ops")
+    }
+
+    @Test
+    fun `unregister of one registration of a shared interceptor instance leaves the other`() = runTest {
+        val counter = AtomicInteger(0)
+        val shared = Interceptor.read<Request> { counter.incrementAndGet() }
+        val first = registry.add(shared)
+        registry.add(shared)
+
+        first.unregister()
+        first.unregister()
+        registry.applyInterceptors(Request("x"))
+
+        assertEquals(1, counter.get())
+    }
+
+    // ── Index-based chain semantics ──────────────────────────────────────
+
+    open class Base(val tag: String)
+    class Derived(tag: String) : Base(tag)
+
+    @Test
+    fun `supertype interceptors apply to subtypes merged by priority`() = runTest {
+        val order = CopyOnWriteArrayList<String>()
+        registry.add(Interceptor.read<Any> { order.add("any@5") }, priority = 5)
+        registry.add(Interceptor.read<Base> { order.add("base@1") }, priority = 1)
+        registry.add(Interceptor.read<Derived> { order.add("derived@3") }, priority = 3)
+
+        registry.applyInterceptors(Derived::class, Derived("d"))
+        assertEquals(listOf("base@1", "derived@3", "any@5"), order)
+
+        order.clear()
+        registry.applyInterceptors(Base::class, Base("b"))
+        assertEquals(listOf("base@1", "any@5"), order, "subtype interceptors must not apply to supertypes")
+    }
+
+    @Test
+    fun `multiple proceed calls re-run the downstream chain each time`() = runTest {
+        val downstreamRuns = AtomicInteger(0)
+        registry.add(Interceptor.full<Request> { data, proceed ->
+            val first = proceed(data)
+            val second = proceed(first)
+            proceed(second)
+        }, priority = 0)
+        registry.add(Interceptor.transform<Request> {
+            downstreamRuns.incrementAndGet()
+            it.copy(value = it.value + 1)
+        }, priority = 1)
+
+        val result = registry.applyInterceptors(Request("r", value = 0))
+
+        assertEquals(3, result.value)
+        assertEquals(3, downstreamRuns.get())
+    }
+
+    @Test
+    fun `short-circuit skips all later interceptors`() = runTest {
+        val later = AtomicInteger(0)
+        registry.add(Interceptor<Request> { data, _ -> data.copy(id = "short") }, priority = 0)
+        registry.add(Interceptor.read<Request> { later.incrementAndGet() }, priority = 1)
+        registry.add(Interceptor.read<Any> { later.incrementAndGet() }, priority = 2)
+
+        assertEquals("short", registry.applyInterceptors(Request("r")).id)
+        assertEquals(0, later.get())
+    }
+
+    @Test
+    fun `wrong-typed value from a supertype interceptor fails with ClassCastException`() = runTest {
+        registry.add(Interceptor<Any> { _, chain -> chain.proceed("not a request") }, priority = 0)
+        registry.add(Interceptor.read<Request> { }, priority = 1)
+
+        val outcome = runCatching { registry.applyInterceptors(Request("r")) }
+        assertTrue(outcome.exceptionOrNull() is ClassCastException, "got $outcome")
+    }
+
+    @Test
+    fun `wrong-typed result returned to the caller fails with ClassCastException`() = runTest {
+        registry.add(Interceptor<Any> { _, _ -> "not a request" })
+
+        val outcome = runCatching { registry.applyInterceptors(Request("r")) }
+        assertTrue(outcome.exceptionOrNull() is ClassCastException, "got $outcome")
+    }
+
+    @Test
+    fun `interceptor registered during execution does not affect the running call`() = runTest {
+        val lateCalls = AtomicInteger(0)
+        registry.add(Interceptor<Request> { data, chain ->
+            registry.add(Interceptor.read<Request> { lateCalls.incrementAndGet() }, priority = 10)
+            chain.proceed(data)
+        }, priority = 0)
+
+        registry.applyInterceptors(Request("first"))
+        assertEquals(0, lateCalls.get(), "snapshot must be isolated from concurrent registration")
+
+        registry.applyInterceptors(Request("second"))
+        assertEquals(1, lateCalls.get())
+    }
+
+    @Test
+    fun `primitive types such as Int are supported`() = runTest {
+        registry.add(Interceptor.transform<Int> { it * 2 })
+        registry.add(Interceptor.transform<Number> { (it.toInt() + 1) })
+
+        assertEquals(11, registry.applyInterceptors(Int::class, 5))
+        assertEquals(11, registry.applyInterceptors(5))
+    }
+
+    @Test
+    fun `cached chain is reused and reflects later registrations`() = runTest {
+        registry.add(Interceptor.transform<Request> { it.copy(value = it.value + 1) })
+        repeat(3) { assertEquals(1, registry.applyInterceptors(Request("r")).value) }
+
+        val reg = registry.add(Interceptor.transform<Request> { it.copy(value = it.value * 10) })
+        assertEquals(10, registry.applyInterceptors(Request("r")).value)
+
+        reg.unregister()
+        assertEquals(1, registry.applyInterceptors(Request("r")).value)
+    }
 }
