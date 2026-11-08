@@ -272,16 +272,47 @@ internal class RegistrationTracker {
      * [registration] is unregistered immediately and returned as-is.
      */
     fun track(registration: Registration): Registration {
-        val accepted = synchronized(registrations) {
-            if (isDisposed) false else registrations.add(registration)
-        }
-        if (!accepted) {
-            registration.unregister()
-            return registration
-        }
+        if (!accept(registration)) return registration
         return Registration {
             synchronized(registrations) { registrations.remove(registration) }
             registration.unregister()
+        }
+    }
+
+    /**
+     * Adds [registration] to [registrations] unless disposed, in which case it
+     * is unregistered immediately. Returns `true` if it is now tracked.
+     */
+    private fun accept(registration: Registration): Boolean {
+        val accepted = synchronized(registrations) {
+            if (isDisposed) false else registrations.add(registration)
+        }
+        if (!accepted) registration.unregister()
+        return accepted
+    }
+
+    /**
+     * A [MutableList] view of [registrations] for **ABI compatibility only**.
+     *
+     * Code compiled against 1.0.x inlined `registrations.add(registration)`
+     * into its own bytecode (via the old `Intercept` bodies of [NodeScope] and
+     * [CoordinatorScope]). This view keeps that bytecode correct: every `add`
+     * (including `addAll` and indexed `add`, which append) goes through the
+     * disposed check, so a registration added after [dispose] is unregistered
+     * immediately rather than leaked. Reads, `set` and removals operate on the
+     * live synchronized list; iteration is not atomic with concurrent
+     * registration (take a copy under `synchronized(registrations)` if needed).
+     */
+    fun mutableView(): MutableList<Registration> = TrackedRegistrationsView()
+
+    private inner class TrackedRegistrationsView : AbstractMutableList<Registration>() {
+        override val size: Int get() = registrations.size
+        override fun get(index: Int): Registration = registrations[index]
+        override fun set(index: Int, element: Registration): Registration = registrations.set(index, element)
+        override fun removeAt(index: Int): Registration = registrations.removeAt(index)
+        override fun add(element: Registration): Boolean = accept(element)
+        override fun add(index: Int, element: Registration) {
+            accept(element)
         }
     }
 
