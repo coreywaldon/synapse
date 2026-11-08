@@ -4,6 +4,7 @@ import com.synapselib.arch.base.Channel
 import com.synapselib.arch.base.Direction
 import com.synapselib.arch.base.InterceptPoint
 import com.synapselib.arch.base.TraceContext
+import com.synapselib.arch.base.withTrace
 import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -11,6 +12,9 @@ import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 
+// Most tests here deliberately exercise the deprecated setTraceListener / setGlobalLogger
+// shims to keep them covered; the observer-based API is tested at the end.
+@Suppress("DEPRECATION")
 class TraceContextTest {
 
     @get:Rule
@@ -121,5 +125,21 @@ class TraceContextTest {
 
         assertEquals(2, traceIds.size)
         assertEquals(2, traceIds.distinct().size)
+    }
+
+    @Test
+    fun observerReceivesCoordinatorTraceAndParentLinks() = synapse.runTest {
+        val traces = mutableListOf<TraceContext>()
+        synapse.switchBoard.addObserver { point, _, _, trace ->
+            if (point == InterceptPoint.REACTION_UPSTREAM && trace != null) traces += trace
+        }
+
+        synapse.Coordinator(tag = "Outer") {
+            launch { withTrace("Root") { Trigger(Ping("nested")) } }
+        }
+
+        assertEquals(1, traces.size)
+        assertEquals("Outer", traces[0].emitterTag)
+        assertNotNull(traces[0].parentTraceId)
     }
 }
